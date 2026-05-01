@@ -23,23 +23,38 @@ EN: 5 s wav → ~1.2 s wall time. ZH: same. See [`bench/`](bench/).
 
 - macOS Apple Silicon only. No Linux / Intel Mac / Windows.
 - `.wav` only (`.mp3` / `.m4a` planned for v0.3+).
-- Currently dynamically linked against `brew install llama.cpp` and `ggml`.
-  M5.5 (static vendoring) is in progress; binary is **not** yet self-contained.
 - `<asr_text>` output protocol is a Qwen3-ASR specific quirk; mtmd marks
   audio support as "experimental" upstream.
 
 ## Install
 
-### Prerequisites
+### Pre-built (recommended)
 
 ```sh
-brew install zig llama.cpp ggml
+brew install agent-rt/tap/asrctl
 ```
 
-- Zig **0.16.0** or newer (uses the new `std.Io` API).
-- llama.cpp **8990** or newer (need PR #19441 for Qwen3 ASR `qwen3a` projector).
-- macOS Apple Silicon (M1/M2/M3/M4).
+This is a fully self-contained binary — only depends on macOS system
+frameworks (Metal / Foundation / Accelerate). No `brew install llama.cpp`
+required at runtime.
+
+### Build from source
+
+```sh
+brew install zig cmake          # cmake compiles the bundled llama.cpp
+git clone https://github.com/agent-rt/asrctl
+cd asrctl
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/asrctl --help
+```
+
+- **Zig** 0.16.0 (new `std.Io` API).
+- **CMake** to compile the vendored llama.cpp into static libraries.
+- **macOS Apple Silicon** (M1/M2/M3/M4) with Xcode Command Line Tools.
 - `curl` for HuggingFace download (ships with macOS).
+
+The first `zig build` takes ~5 minutes to compile llama.cpp + ggml. Subsequent
+builds reuse the cmake cache.
 
 ### Build
 
@@ -111,8 +126,12 @@ Single Zig binary, ~5 modules under [`src/`](src/):
 - `hf.zig` — HuggingFace cache resolver + `curl` downloader
 - `asr.zig` — in-process pipeline: load → mtmd → eval → sample → parse
 - `server.zig` — HTTP fallback via `llama-server` `/v1/audio/transcriptions`
-- `backend.zig` — discover the active brew `libexec/` for ggml backend dylibs
 - `errors.zig` — wrap internal errors into human-readable diagnostics
+
+`build.zig` shells out to `cmake` to compile the vendored llama.cpp + ggml +
+mtmd into static `.a` files (one-time, cached), then links them statically
+into asrctl. `GGML_METAL_EMBED_LIBRARY=ON` puts the Metal shader source
+inline so we don't need to ship a separate `default.metallib`.
 
 The transcription pipeline (in `asr.zig`) follows the same shape as
 `llama-mtmd-cli`:

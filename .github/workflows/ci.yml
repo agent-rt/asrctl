@@ -12,12 +12,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install brew runtime deps
+      - name: Verify build prereqs
         run: |
-          brew update
-          brew install llama.cpp ggml
-          brew --prefix llama.cpp
-          ls /opt/homebrew/opt/llama.cpp/lib
+          cmake --version
+          xcrun --find clang++
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -34,3 +32,9 @@ jobs:
           ./zig-out/bin/asrctl version
           ./zig-out/bin/asrctl help > /dev/null
           ./zig-out/bin/asrctl model path
+          # Confirm static linkage: should only depend on system frameworks.
+          otool -L zig-out/bin/asrctl | tee /tmp/otool.txt
+          if grep -q '/opt/homebrew' /tmp/otool.txt; then
+            echo "ERROR: binary still links against brew dylibs" >&2
+            exit 1
+          fi

@@ -38,10 +38,10 @@ jobs:
           echo "version=$VERSION"                      >> "$GITHUB_OUTPUT"
           echo "rel_tag=${{ env.PRODUCT }}-${TAG}"     >> "$GITHUB_OUTPUT"
 
-      - name: Install brew runtime deps
+      - name: Verify build prereqs
         run: |
-          brew update
-          brew install llama.cpp ggml
+          cmake --version
+          xcrun --find clang++
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -149,8 +149,6 @@ jobs:
 
             depends_on :macos
             depends_on arch: :arm64
-            depends_on "llama.cpp"
-            depends_on "ggml"
 
             on_macos do
               on_arm do

@@ -19,7 +19,6 @@ pub const Error = error{
 pub const Options = struct {
     model_path: [:0]const u8,
     mmproj_path: [:0]const u8,
-    backend_libexec: [:0]const u8,
     audio_path: [:0]const u8,
     n_threads: i32 = 4,
     n_ctx: u32 = 4096,
@@ -42,8 +41,9 @@ pub const Result = struct {
 };
 
 pub fn transcribe(allocator: std.mem.Allocator, opts: Options) Error!Result {
-    c.ggml_backend_load_all_from_path(opts.backend_libexec.ptr);
-
+    // Static build: backends self-register at static-init via the
+    // ggml_backend_registry constructor in ggml-backend-reg.cpp. No dynamic
+    // load_all_from_path needed.
     c.llama_backend_init();
     defer c.llama_backend_free();
 

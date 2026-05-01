@@ -153,7 +153,7 @@ asrctl model pull         从 HF 下载默认模型到缓存
    - M5.2 性能 bench：✅ `bench/bench.sh` + `bench/results-2026-05-02.txt`，server 路径 3-5x 快于进程内
    - M5.3 README：✅
    - M5.4 lint：✅ zig fmt 通过
-   - M5.5 vendor 静态化：⏸️ **可行性 spike 完成**（见 [M5.5-vendor-spike.md](./M5.5-vendor-spike.md)），实施推迟到独立 sprint。Metal toolchain 不阻塞，brew 静态库不可用，要真做需 vendor upstream 源码 ~3-4 天。v0.1 接受 brew dylib 依赖。
+   - M5.5 vendor 静态化：✅ 通过（2026-05-02），见 [M5.5-report.md](./M5.5-report.md)。换思路 cmake-shellout 取代手写 build.zig，1 小时完成（spike 估 3-4 天）。`otool -L` 只剩系统 framework，二进制 9.3 MB，性能与 dylib 版完全一致。`GGML_METAL_EMBED_LIBRARY=ON` 让 shader 源码内嵌运行时编译，无需 metallib 文件。
 
 ## 9. 待决事项
 

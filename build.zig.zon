@@ -3,7 +3,12 @@
     .version = "0.0.1",
     .fingerprint = 0x48e86bacc4ac4789,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .llama_cpp = .{
+            .url = "git+https://github.com/ggml-org/llama.cpp?ref=b8990#660b1b4bdc6fedc18e8c3d87a945ffb51f91c547",
+            .hash = "N-V-__8AAJNA6gh3FGTZ0lTleWAvHocOK6TCXG8dUhrxBDHX",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

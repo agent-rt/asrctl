@@ -3,7 +3,6 @@ const c = @import("c");
 const cli = @import("cli.zig");
 const hf = @import("hf.zig");
 const asr = @import("asr.zig");
-const backend = @import("backend.zig");
 const server = @import("server.zig");
 const errors = @import("errors.zig");
 
@@ -140,28 +139,18 @@ fn transcribe(
     };
     defer allocator.free(mmproj_path);
 
-    const libexec = backend.resolveLibexec(allocator, io) catch |err| {
-        errors.print("error", err);
-        return 2;
-    };
-    defer allocator.free(libexec);
-    const libexec_z = try allocator.dupeZ(u8, libexec);
-    defer allocator.free(libexec_z);
-
     const audio_z = try allocator.dupeZ(u8, args.audio_path);
     defer allocator.free(audio_z);
 
     if (args.verbose) {
         std.debug.print("model:   {s}\n", .{model_path});
         std.debug.print("mmproj:  {s}\n", .{mmproj_path});
-        std.debug.print("backend: {s}\n", .{libexec});
         std.debug.print("audio:   {s}\n", .{audio_z});
     }
 
     const result = asr.transcribe(allocator, .{
         .model_path = model_path,
         .mmproj_path = mmproj_path,
-        .backend_libexec = libexec_z,
         .audio_path = audio_z,
         .n_threads = args.threads orelse 4,
     }) catch |err| {

@@ -1,29 +1,71 @@
 const std = @import("std");
 
-// M1 strategy: link against brew-installed llama.cpp dylibs instead of building
-// upstream from source. Single-binary static linking is deferred to M5.
-const brew_prefix_default = "/opt/homebrew";
+// M5.5 vendor static build:
+//   1. `b.dependency("llama_cpp")` gives us upstream source via build.zig.zon.
+//   2. We shell out to cmake to compile upstream into static libraries — much
+//      less code than hand-porting the cmake tree (ggml + cpu + metal + blas
+//      multi-arch detection is ~600 lines of cmake-script logic).
+//   3. We link the resulting .a files + system frameworks statically into
+//      asrctl. Result: `otool -L` shows only system dylibs, no brew deps.
+//
+// `-DGGML_METAL_EMBED_LIBRARY=ON` makes ggml-metal compile its .metal shaders
+// inline as a C string, so we don't ship a separate `default.metallib`.
+//
+// Trade-off: cmake is now a build prereq alongside Zig. README documents it.
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const brew_prefix = b.option(
-        []const u8,
-        "brew-prefix",
-        "Homebrew prefix (default: /opt/homebrew)",
-    ) orelse brew_prefix_default;
+    const llama_dep = b.dependency("llama_cpp", .{});
+    const llama_root = llama_dep.path("");
 
-    const include_path = b.pathJoin(&.{ brew_prefix, "include" });
-    const lib_path = b.pathJoin(&.{ brew_prefix, "lib" });
+    // Run upstream's cmake build to produce static .a files. Outputs land in
+    // a private build dir under the zig cache so incremental rebuilds work.
+    const cmake_build = b.addSystemCommand(&.{
+        "bash", "-eu", "-c",
+        \\set -eu
+        \\SRC="$1"; OUT="$2"
+        \\mkdir -p "$OUT"
+        \\if [ ! -f "$OUT/.configured" ]; then
+        \\  cmake "$SRC" -B "$OUT" \
+        \\    -DCMAKE_BUILD_TYPE=Release \
+        \\    -DBUILD_SHARED_LIBS=OFF \
+        \\    -DGGML_BACKEND_DL=OFF \
+        \\    -DGGML_NATIVE=OFF \
+        \\    -DGGML_METAL=ON \
+        \\    -DGGML_METAL_EMBED_LIBRARY=ON \
+        \\    -DGGML_BLAS=ON \
+        \\    -DGGML_OPENMP=OFF \
+        \\    -DLLAMA_BUILD_TESTS=OFF \
+        \\    -DLLAMA_BUILD_EXAMPLES=OFF \
+        \\    -DLLAMA_BUILD_TOOLS=ON \
+        \\    -DLLAMA_BUILD_SERVER=OFF \
+        \\    -DLLAMA_CURL=OFF >/dev/null
+        \\  touch "$OUT/.configured"
+        \\fi
+        \\cmake --build "$OUT" --target mtmd --target llama --target ggml -- -j$(sysctl -n hw.ncpu) >/dev/null
+        \\for lib in src/libllama.a tools/mtmd/libmtmd.a \
+        \\           ggml/src/libggml.a ggml/src/libggml-base.a \
+        \\           ggml/src/libggml-cpu.a ggml/src/ggml-metal/libggml-metal.a \
+        \\           ggml/src/ggml-blas/libggml-blas.a; do
+        \\  test -f "$OUT/$lib" || { echo "missing $OUT/$lib" >&2; exit 1; }
+        \\done
+        ,
+        "--",
+    });
+    cmake_build.addDirectoryArg(llama_root);
+    const cmake_out = cmake_build.addOutputDirectoryArg("upstream-build");
 
-    // translate-c the upstream C headers we need.
+    // Module setup.
     const c_translate = b.addTranslateC(.{
         .root_source_file = b.path("src/c.h"),
         .target = target,
         .optimize = optimize,
     });
-    c_translate.addIncludePath(.{ .cwd_relative = include_path });
+    c_translate.addIncludePath(llama_root.path(b, "include"));
+    c_translate.addIncludePath(llama_root.path(b, "ggml/include"));
+    c_translate.addIncludePath(llama_root.path(b, "tools/mtmd"));
     const c_mod = c_translate.createModule();
 
     const exe_mod = b.createModule(.{
@@ -38,18 +80,24 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
-    // Link against system llama.cpp / mtmd / ggml. In Zig 0.16 these helpers
-    // live on the module, not the Compile step.
-    exe_mod.addLibraryPath(.{ .cwd_relative = lib_path });
-    exe_mod.linkSystemLibrary("llama", .{});
-    exe_mod.linkSystemLibrary("mtmd", .{});
-    exe_mod.linkSystemLibrary("ggml", .{});
-    exe_mod.linkSystemLibrary("ggml-base", .{});
-    exe_mod.link_libc = true;
+    // Link the static libs produced by cmake. Order matters: consumers first,
+    // dependencies later. mtmd → llama → ggml → ggml-base, plus the backend
+    // libs which contribute their `register_backend` constructors.
+    exe_mod.addObjectFile(cmake_out.path(b, "tools/mtmd/libmtmd.a"));
+    exe_mod.addObjectFile(cmake_out.path(b, "src/libllama.a"));
+    exe_mod.addObjectFile(cmake_out.path(b, "ggml/src/libggml.a"));
+    exe_mod.addObjectFile(cmake_out.path(b, "ggml/src/ggml-blas/libggml-blas.a"));
+    exe_mod.addObjectFile(cmake_out.path(b, "ggml/src/ggml-metal/libggml-metal.a"));
+    exe_mod.addObjectFile(cmake_out.path(b, "ggml/src/libggml-cpu.a"));
+    exe_mod.addObjectFile(cmake_out.path(b, "ggml/src/libggml-base.a"));
 
-    // Embed an rpath so the produced binary can find the brew dylibs at runtime
-    // without DYLD_LIBRARY_PATH. M5 will replace this with static linking.
-    exe_mod.addRPathSpecial(lib_path);
+    exe_mod.linkFramework("Metal", .{});
+    exe_mod.linkFramework("MetalKit", .{});
+    exe_mod.linkFramework("Foundation", .{});
+    exe_mod.linkFramework("Accelerate", .{});
+    exe_mod.linkFramework("CoreFoundation", .{});
+    exe_mod.link_libc = true;
+    exe_mod.link_libcpp = true;
 
     b.installArtifact(exe);
 
