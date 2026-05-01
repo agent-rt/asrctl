@@ -1,0 +1,49 @@
+asrctl bench snapshot — 2026-05-02
+==================================
+Hardware:  Apple M2 Pro, 32 GB unified memory
+Backend:   ggml 0.10.1, llama.cpp 8990 (brew dylib)
+Model:     ggml-org/Qwen3-ASR-0.6B-GGUF, Q8_0 (~750 MB) + mmproj (~720 MB)
+
+                          wall time
+                          ─────────
+EN short (5.4s audio)
+  cold (in-process)        ~1.5 s
+  warm (in-process)        ~1.2 s
+  cold (server)            ~0.6 s
+  warm (server)            ~0.3 s
+
+EN long (17.0s audio)
+  cold (in-process)        ~1.7 s
+  warm (in-process)        ~1.7 s
+  cold (server)            ~0.9 s
+  warm (server)            ~0.6 s
+
+ZH short (3.7s audio)
+  cold (in-process)        ~1.2 s
+  warm (in-process)        ~1.2 s
+  cold (server)            ~0.5 s
+  warm (server)            ~0.3 s
+
+ZH long (17.2s audio)
+  cold (in-process)        ~1.7 s
+  warm (in-process)        ~1.7 s
+  cold (server)            ~0.9 s
+  warm (server)            ~0.6 s
+
+Notes
+-----
+- 17s audio total wall ≈ 5s audio total wall: fixed cost (model load + Metal
+  kernel JIT) dominates. The actual ASR encode/decode scales sub-linearly with
+  audio length (encoder takes ~50ms per second of audio).
+- Server path is 3-5x faster because model load + JIT happen once at server
+  startup; per-request only encode + decode + HTTP overhead.
+- All results well below REQ.md §5 target (30s audio ≤ 5s wall time).
+- "Warm" sometimes equals or slightly exceeds "cold" because each invocation
+  is still a fresh process — no Metal pipeline cache across runs. A persistent
+  daemon would amortize this; v0.2 (real-time mode) will need that anyway.
+
+Reproduce:
+  zig build
+  bench/bench.sh                          # in-process
+  llama-server -hf ggml-org/Qwen3-ASR-0.6B-GGUF --port 8765 &
+  bench/bench.sh --server http://127.0.0.1:8765

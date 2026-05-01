@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install brew runtime deps
+        run: |
+          brew update
+          brew install llama.cpp ggml
+          brew --prefix llama.cpp
+          ls /opt/homebrew/opt/llama.cpp/lib
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: zig fmt --check
+        run: zig fmt --check src/ build.zig
+
+      - name: zig build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: smoke
+        run: |
+          ./zig-out/bin/asrctl version
+          ./zig-out/bin/asrctl help > /dev/null
+          ./zig-out/bin/asrctl model path

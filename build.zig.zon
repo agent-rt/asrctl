@@ -1,0 +1,13 @@
+.{
+    .name = .asrctl,
+    .version = "0.0.1",
+    .fingerprint = 0x48e86bacc4ac4789,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "docs",
+    },
+}

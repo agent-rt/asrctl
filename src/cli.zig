@@ -1,0 +1,119 @@
+//! Minimal hand-rolled argument parser. Subcommands:
+//!   transcribe <file.wav>  — default if first non-flag arg ends with .wav
+//!   model path             — print resolved model path
+//!   model pull             — download model + mmproj
+//!   version                — print version
+//!   help / -h / --help
+
+const std = @import("std");
+
+pub const Subcommand = union(enum) {
+    transcribe: TranscribeArgs,
+    model_path,
+    model_pull,
+    version,
+    help,
+};
+
+pub const TranscribeArgs = struct {
+    audio_path: []const u8,
+    output_path: ?[]const u8 = null,
+    model_path: ?[]const u8 = null,
+    server_url: ?[]const u8 = null,
+    threads: ?i32 = null,
+    verbose: bool = false,
+};
+
+pub const ParseError = error{
+    InvalidArgs,
+    UnknownFlag,
+    MissingValue,
+} || std.mem.Allocator.Error || std.fmt.ParseIntError;
+
+pub const usage_text =
+    \\asrctl — macOS Apple Silicon ASR CLI (Qwen3-ASR via llama.cpp + mtmd)
+    \\
+    \\Usage:
+    \\  asrctl <wav-file> [options]            transcribe a wav file
+    \\  asrctl model path                      print resolved model path
+    \\  asrctl model pull                      download model + mmproj from HF
+    \\  asrctl version                         print version
+    \\  asrctl help                            show this help
+    \\
+    \\Transcribe options:
+    \\  -o, --output PATH    write text to file instead of stdout
+    \\      --model PATH     override model gguf path
+    \\      --server-url URL forward to a running llama-server instead of
+    \\                       loading the model in-process (e.g. http://127.0.0.1:8080)
+    \\      --threads N      CPU threads (default 4)
+    \\  -v, --verbose        print timing/diagnostic info to stderr
+    \\
+    \\Environment:
+    \\  HF_HOME              HuggingFace cache root (default ~/.cache/huggingface)
+    \\  HF_ENDPOINT          HF mirror, e.g. https://hf-mirror.com
+    \\
+;
+
+/// argv contains the program name at [0]; parses argv[1..].
+pub fn parse(argv: []const [*:0]const u8) ParseError!Subcommand {
+    if (argv.len < 2) return .help;
+
+    const a1 = std.mem.span(argv[1]);
+
+    // Top-level keywords.
+    if (std.mem.eql(u8, a1, "help") or std.mem.eql(u8, a1, "-h") or std.mem.eql(u8, a1, "--help")) {
+        return .help;
+    }
+    if (std.mem.eql(u8, a1, "version") or std.mem.eql(u8, a1, "--version")) {
+        return .version;
+    }
+    if (std.mem.eql(u8, a1, "model")) {
+        if (argv.len < 3) return error.InvalidArgs;
+        const sub = std.mem.span(argv[2]);
+        if (std.mem.eql(u8, sub, "path")) return .model_path;
+        if (std.mem.eql(u8, sub, "pull")) return .model_pull;
+        return error.InvalidArgs;
+    }
+    if (std.mem.eql(u8, a1, "transcribe")) {
+        return parseTranscribe(argv[2..]);
+    }
+    // Default: treat as `transcribe <a1> ...` when a1 looks like a file.
+    return parseTranscribe(argv[1..]);
+}
+
+fn parseTranscribe(rest: []const [*:0]const u8) ParseError!Subcommand {
+    var args: TranscribeArgs = .{ .audio_path = "" };
+    var positional_seen = false;
+
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = std.mem.span(rest[i]);
+        if (std.mem.eql(u8, a, "-o") or std.mem.eql(u8, a, "--output")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.output_path = std.mem.span(rest[i]);
+        } else if (std.mem.eql(u8, a, "--model")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.model_path = std.mem.span(rest[i]);
+        } else if (std.mem.eql(u8, a, "--server-url")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.server_url = std.mem.span(rest[i]);
+        } else if (std.mem.eql(u8, a, "--threads")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.threads = try std.fmt.parseInt(i32, std.mem.span(rest[i]), 10);
+        } else if (std.mem.eql(u8, a, "-v") or std.mem.eql(u8, a, "--verbose")) {
+            args.verbose = true;
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            return error.UnknownFlag;
+        } else {
+            if (positional_seen) return error.InvalidArgs;
+            args.audio_path = a;
+            positional_seen = true;
+        }
+    }
+    if (!positional_seen) return error.InvalidArgs;
+    return .{ .transcribe = args };
+}
