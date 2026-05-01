@@ -96,6 +96,9 @@ pub fn build(b: *std.Build) void {
     exe_mod.linkFramework("Foundation", .{});
     exe_mod.linkFramework("Accelerate", .{});
     exe_mod.linkFramework("CoreFoundation", .{});
+    // AudioToolbox.AudioQueue: microphone capture for `asrctl listen` (v0.2).
+    exe_mod.linkFramework("AudioToolbox", .{});
+    exe_mod.linkFramework("CoreAudio", .{});
     exe_mod.link_libc = true;
     exe_mod.link_libcpp = true;
 

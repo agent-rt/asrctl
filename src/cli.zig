@@ -9,10 +9,20 @@ const std = @import("std");
 
 pub const Subcommand = union(enum) {
     transcribe: TranscribeArgs,
+    listen: ListenArgs,
     model_path,
     model_pull,
     version,
     help,
+};
+
+pub const ListenArgs = struct {
+    output_path: ?[]const u8 = null,
+    model_path: ?[]const u8 = null,
+    threads: ?i32 = null,
+    threshold: ?f32 = null,
+    silence_ms: ?u32 = null,
+    verbose: bool = false,
 };
 
 pub const TranscribeArgs = struct {
@@ -35,6 +45,7 @@ pub const usage_text =
     \\
     \\Usage:
     \\  asrctl <wav-file> [options]            transcribe a wav file
+    \\  asrctl listen [options]                live mic → text (Ctrl-C to stop)
     \\  asrctl model path                      print resolved model path
     \\  asrctl model pull                      download model + mmproj from HF
     \\  asrctl version                         print version
@@ -47,6 +58,14 @@ pub const usage_text =
     \\                       loading the model in-process (e.g. http://127.0.0.1:8080)
     \\      --threads N      CPU threads (default 4)
     \\  -v, --verbose        print timing/diagnostic info to stderr
+    \\
+    \\Listen options (asrctl listen):
+    \\  -o, --output PATH    append each utterance to file instead of stdout
+    \\      --model PATH     override model gguf path
+    \\      --threshold F    VAD RMS threshold (default 0.012)
+    \\      --silence-ms N   silence duration that ends an utterance (default 600)
+    \\      --threads N      CPU threads (default 4)
+    \\  -v, --verbose        print VAD/timing info to stderr
     \\
     \\Environment:
     \\  HF_HOME              HuggingFace cache root (default ~/.cache/huggingface)
@@ -77,8 +96,45 @@ pub fn parse(argv: []const [*:0]const u8) ParseError!Subcommand {
     if (std.mem.eql(u8, a1, "transcribe")) {
         return parseTranscribe(argv[2..]);
     }
+    if (std.mem.eql(u8, a1, "listen")) {
+        return parseListen(argv[2..]);
+    }
     // Default: treat as `transcribe <a1> ...` when a1 looks like a file.
     return parseTranscribe(argv[1..]);
+}
+
+fn parseListen(rest: []const [*:0]const u8) ParseError!Subcommand {
+    var args: ListenArgs = .{};
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = std.mem.span(rest[i]);
+        if (std.mem.eql(u8, a, "-o") or std.mem.eql(u8, a, "--output")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.output_path = std.mem.span(rest[i]);
+        } else if (std.mem.eql(u8, a, "--model")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.model_path = std.mem.span(rest[i]);
+        } else if (std.mem.eql(u8, a, "--threads")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.threads = try std.fmt.parseInt(i32, std.mem.span(rest[i]), 10);
+        } else if (std.mem.eql(u8, a, "--threshold")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.threshold = std.fmt.parseFloat(f32, std.mem.span(rest[i])) catch return error.InvalidArgs;
+        } else if (std.mem.eql(u8, a, "--silence-ms")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.silence_ms = try std.fmt.parseInt(u32, std.mem.span(rest[i]), 10);
+        } else if (std.mem.eql(u8, a, "-v") or std.mem.eql(u8, a, "--verbose")) {
+            args.verbose = true;
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+    return .{ .listen = args };
 }
 
 fn parseTranscribe(rest: []const [*:0]const u8) ParseError!Subcommand {

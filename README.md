@@ -9,14 +9,15 @@ on the Metal backend.
 asrctl audio.wav            # → stdout
 asrctl audio.wav -o out.txt # → file
 asrctl --server-url http://127.0.0.1:8080 audio.wav   # forward to llama-server
+asrctl listen               # mic → text stream (Ctrl-C to stop)
 ```
 
 EN: 5 s wav → ~1.2 s wall time. ZH: same. See [`bench/`](bench/).
 
 ## Status
 
-- ✅ MVP (v0.1): wav transcription, in-process + llama-server fallback.
-- 🚧 v0.2: real-time microphone streaming (planned).
+- ✅ v0.1: wav transcription, in-process + llama-server fallback.
+- ✅ v0.2: real-time microphone streaming via `asrctl listen`.
 - See [`docs/REQ.md`](docs/REQ.md) for the full requirements & milestones.
 
 ## Limitations
@@ -100,6 +101,28 @@ Environment:
 ```
 
 Exit codes: `0` ok / `1` user error / `2` internal / `3` inference / `4` server.
+
+### Live microphone (`listen`)
+
+```sh
+asrctl listen                     # speak; Ctrl-C to stop
+asrctl listen -v                  # see VAD + per-utterance timing on stderr
+asrctl listen -o transcript.log   # append each utterance as a new line
+asrctl listen --threshold 0.02 --silence-ms 500   # tune VAD for your env
+```
+
+Pipeline: 16 kHz mono PCM from CoreAudio's AudioQueue → energy-based VAD
+(RMS threshold + silence-duration cut) → for each detected utterance, the
+loaded model runs `mtmd_bitmap_init_from_audio` + `mtmd_helper_eval_chunks`
++ greedy sampling → text printed.
+
+The model loads once on `listen` start; per-utterance latency is just the
+ASR encode/decode (~0.3-0.6 s for short phrases). First run prompts macOS
+for microphone permission.
+
+Caveat: Qwen3-ASR is not natively streaming — partial words are not emitted
+during speech. The listen mode segments by silence and transcribes the
+finished utterance.
 
 ### Server fallback
 

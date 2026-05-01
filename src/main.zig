@@ -5,6 +5,8 @@ const hf = @import("hf.zig");
 const asr = @import("asr.zig");
 const server = @import("server.zig");
 const errors = @import("errors.zig");
+const audio = @import("audio.zig");
+const vad = @import("vad.zig");
 
 const version = "0.0.1";
 
@@ -64,6 +66,7 @@ fn run(init: std.process.Init) !u8 {
         .model_path => return modelPath(allocator, io, &env),
         .model_pull => return modelPull(allocator, io, &env),
         .transcribe => |args| return transcribe(allocator, io, &env, args),
+        .listen => |args| return listen(allocator, io, &env, args),
     }
 }
 
@@ -148,12 +151,36 @@ fn transcribe(
         std.debug.print("audio:   {s}\n", .{audio_z});
     }
 
-    const result = asr.transcribe(allocator, .{
+    // v0.2.0 spike: route through Session.transcribePCM (raw f32 PCM) to
+    // verify that our wav decoder + mtmd_bitmap_init_from_audio path produces
+    // the same output as mtmd_helper_bitmap_init_from_file. If it does, the
+    // listen subcommand can reuse this exact code path with mic samples.
+    // v0.2.0: route through Session + decoded PCM. Same path the listen
+    // subcommand will use with mic samples; one less code path to maintain.
+    var session = asr.Session.open(allocator, .{
         .model_path = model_path,
         .mmproj_path = mmproj_path,
-        .audio_path = audio_z,
         .n_threads = args.threads orelse 4,
     }) catch |err| {
+        errors.print("error", err);
+        return 3;
+    };
+    defer session.close();
+
+    const decoded = asr.Wav.decodeFile(allocator, io, args.audio_path) catch |err| {
+        errors.print("error", err);
+        return 1;
+    };
+    defer decoded.deinit(allocator);
+    if (args.verbose) std.debug.print(
+        "wav: {d} samples @ {d} Hz ({d:.2}s)\n",
+        .{
+            decoded.samples.len,
+            decoded.sample_rate,
+            @as(f64, @floatFromInt(decoded.samples.len)) / @as(f64, @floatFromInt(decoded.sample_rate)),
+        },
+    );
+    const result = session.transcribePCM(decoded.samples) catch |err| {
         errors.print("error", err);
         return 3;
     };
@@ -166,6 +193,158 @@ fn transcribe(
     try writeText(io, args.output_path, result.text);
     return 0;
 }
+
+// ---------- listen subcommand (v0.2 real-time mic) ----------
+
+var g_running: std.atomic.Value(bool) = .init(true);
+
+extern "c" fn usleep(usec: u32) c_int;
+
+fn sigintHandler(_: std.posix.SIG) callconv(.c) void {
+    g_running.store(false, .release);
+}
+
+fn listen(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args: cli.ListenArgs,
+) !u8 {
+    if (!args.verbose) {
+        c.llama_log_set(quietLogCb, null);
+        c.mtmd_helper_log_set(quietLogCb, null);
+    }
+
+    // Resolve model paths (same flow as transcribe).
+    const model_path = if (args.model_path) |p|
+        try allocator.dupeZ(u8, p)
+    else blk: {
+        const p = try hf.ensureFile(allocator, io, env, .{ .repo = repo, .filename = model_filename });
+        defer allocator.free(p);
+        break :blk try allocator.dupeZ(u8, p);
+    };
+    defer allocator.free(model_path);
+
+    const mmproj_path = blk: {
+        const p = try hf.ensureFile(allocator, io, env, .{ .repo = repo, .filename = mmproj_filename });
+        defer allocator.free(p);
+        break :blk try allocator.dupeZ(u8, p);
+    };
+    defer allocator.free(mmproj_path);
+
+    var session = asr.Session.open(allocator, .{
+        .model_path = model_path,
+        .mmproj_path = mmproj_path,
+        .n_threads = args.threads orelse 4,
+    }) catch |err| {
+        errors.print("error", err);
+        return 3;
+    };
+    defer session.close();
+
+    var detector = vad.Detector.init(.{
+        .threshold = args.threshold orelse 0.012,
+        .silence_ms = args.silence_ms orelse 600,
+    });
+    defer detector.deinit(allocator);
+
+    const capture = audio.Capture.start(allocator, 16_000) catch |err| {
+        errors.print("error", err);
+        return 3;
+    };
+    defer capture.stop(allocator);
+
+    // Wire Ctrl-C → stop loop. Restore in `defer` so a re-run gets fresh state.
+    var sa: std.posix.Sigaction = .{
+        .handler = .{ .handler = sigintHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &sa, null);
+    defer {
+        var dfl: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.DFL },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.INT, &dfl, null);
+    }
+
+    if (args.verbose) std.debug.print("listening (Ctrl-C to stop)…\n", .{});
+
+    const Ctx = struct {
+        session: *asr.Session,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        output_path: ?[]const u8,
+        verbose: bool,
+        utterance_id: u32 = 0,
+    };
+    var ctx: Ctx = .{
+        .session = &session,
+        .allocator = allocator,
+        .io = io,
+        .output_path = args.output_path,
+        .verbose = args.verbose,
+    };
+
+    const onSegment = struct {
+        fn cb(c_ctx: *Ctx, samples: []const f32) anyerror!void {
+            c_ctx.utterance_id += 1;
+            const dur_ms = samples.len * 1000 / 16_000;
+            if (c_ctx.verbose) std.debug.print(
+                "[utt {d}] {d}ms ({d} samples) → ASR…\n",
+                .{ c_ctx.utterance_id, dur_ms, samples.len },
+            );
+            const result = try c_ctx.session.transcribePCM(samples);
+            defer result.deinit(c_ctx.allocator);
+            if (c_ctx.verbose) std.debug.print(
+                "[utt {d}] language={s}\n",
+                .{ c_ctx.utterance_id, result.language },
+            );
+            if (c_ctx.output_path) |path| {
+                try appendLine(c_ctx.io, path, result.text);
+            } else {
+                try writeStdout(c_ctx.io, result.text);
+                try writeStdout(c_ctx.io, "\n");
+            }
+        }
+    }.cb;
+
+    var pcm_buf: std.ArrayList(f32) = .empty;
+    defer pcm_buf.deinit(allocator);
+
+    while (g_running.load(.acquire)) {
+        // 50 ms pacing: matches our AudioQueue buffer cadence so we drain ~1
+        // callback's worth at a time. Direct usleep since std.posix.nanosleep
+        // and std.Thread.sleep both moved/disappeared in Zig 0.16.
+        _ = usleep(50_000);
+
+        pcm_buf.clearRetainingCapacity();
+        _ = capture.drain(allocator, &pcm_buf) catch continue;
+        if (pcm_buf.items.len == 0) continue;
+
+        detector.feed(allocator, pcm_buf.items, &ctx, onSegment) catch |err| {
+            errors.print("warn", err);
+        };
+    }
+
+    detector.flush(&ctx, onSegment) catch |err| errors.print("warn", err);
+    if (args.verbose) std.debug.print("\nstopped after {d} utterance(s)\n", .{ctx.utterance_id});
+    return 0;
+}
+
+fn appendLine(io: std.Io, path: []const u8, line: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    var file = cwd.openFile(io, path, .{ .mode = .write_only }) catch
+        try cwd.createFile(io, path, .{});
+    defer file.close(io);
+    const offset = (try file.stat(io)).size;
+    try file.writePositionalAll(io, line, offset);
+    try file.writePositionalAll(io, "\n", offset + line.len);
+}
+
+// ---------- helpers ----------
 
 fn writeText(io: std.Io, output_path: ?[]const u8, text: []const u8) !void {
     var buf: [4096]u8 = undefined;
