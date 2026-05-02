@@ -1,0 +1,54 @@
+# vad latency bench — v0.11 (silero quick-cut)
+# Date: 2026-05-03
+# Method: bench-vad subcommand. Pads each wav with 1.5 s of zero-silence,
+# probes silero per-frame P to find true last-voiced (= 'speech end'),
+# then runs Detector with three quick_silence_ms configs.
+
+=== en_short ===
+wav: /Users/linguofeng/agent-rt/asrctl/samples/en_short.wav
+  total samples       = 86698 (5418 ms)
+  silence pad         = 24000 samples (1500 ms)
+  silero last-voiced  = frame 169 (5408 ms) — used as 'true speech end'
+  frame size          = 512 samples (32 ms @ silero)
+
+quick_ms	safety_ms	commit_frame	latency_ms	note
+0	600	80	MID-SPEECH@2560ms	pre-v0.11 (safety only) — cut on inner pause, not utterance end
+250	600	86	MID-SPEECH@2752ms	draft (too aggressive) — cut on inner pause, not utterance end
+400	600	182	416	v0.11 default
+
+=== zh_short ===
+wav: /Users/linguofeng/agent-rt/asrctl/samples/zh_short.wav
+  total samples       = 59526 (3720 ms)
+  silence pad         = 24000 samples (1500 ms)
+  silero last-voiced  = frame 116 (3712 ms) — used as 'true speech end'
+  frame size          = 512 samples (32 ms @ silero)
+
+quick_ms	safety_ms	commit_frame	latency_ms	note
+0	600	60	MID-SPEECH@1920ms	pre-v0.11 (safety only) — cut on inner pause, not utterance end
+250	600	125	288	draft (too aggressive)
+400	600	130	448	v0.11 default
+
+=== en_long ===
+wav: /Users/linguofeng/agent-rt/asrctl/samples/en_long.wav
+  total samples       = 271975 (16998 ms)
+  silence pad         = 24000 samples (1500 ms)
+  silero last-voiced  = frame 531 (16992 ms) — used as 'true speech end'
+  frame size          = 512 samples (32 ms @ silero)
+
+quick_ms	safety_ms	commit_frame	latency_ms	note
+0	600	119	MID-SPEECH@3808ms	pre-v0.11 (safety only) — cut on inner pause, not utterance end
+250	600	539	256	draft (too aggressive)
+400	600	544	416	v0.11 default
+
+=== zh_long ===
+wav: /Users/linguofeng/agent-rt/asrctl/samples/zh_long.wav
+  total samples       = 275564 (17222 ms)
+  silence pad         = 24000 samples (1500 ms)
+  silero last-voiced  = frame 538 (17216 ms) — used as 'true speech end'
+  frame size          = 512 samples (32 ms @ silero)
+
+quick_ms	safety_ms	commit_frame	latency_ms	note
+0	600	59	MID-SPEECH@1888ms	pre-v0.11 (safety only) — cut on inner pause, not utterance end
+250	600	546	256	draft (too aggressive)
+400	600	551	416	v0.11 default
+

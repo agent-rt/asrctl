@@ -12,8 +12,16 @@ pub const Subcommand = union(enum) {
     listen: ListenArgs,
     model_path,
     model_pull,
+    bench_vad: BenchVadArgs,
     version,
     help,
+};
+
+/// Hidden bench subcommand: measures end-of-utterance commit latency of
+/// vad.Detector under different quick_silence_ms configs. Used to validate
+/// the v0.11 adaptive-cut change. Not advertised in usage_text.
+pub const BenchVadArgs = struct {
+    wav_path: []const u8,
 };
 
 pub const ListenArgs = struct {
@@ -139,6 +147,10 @@ pub fn parse(argv: []const [*:0]const u8) ParseError!Subcommand {
     }
     if (std.mem.eql(u8, a1, "listen")) {
         return parseListen(argv[2..]);
+    }
+    if (std.mem.eql(u8, a1, "bench-vad")) {
+        if (argv.len < 3) return error.InvalidArgs;
+        return .{ .bench_vad = .{ .wav_path = std.mem.span(argv[2]) } };
     }
     // Default: treat as `transcribe <a1> ...` when a1 looks like a file.
     return parseTranscribe(argv[1..]);

@@ -5,8 +5,19 @@
 //! subset we need as raw externs. Stable C ABI; no Objective-C blocks.
 //!
 //! Captures mono f32 PCM at 16 kHz (matching what mtmd's audio encoder
-//! expects). Pushes samples into a thread-safe ring buffer; consumer threads
-//! call `drain()` to copy them out.
+//! expects). Two real-time-safety properties:
+//!
+//!   1. **Lock-free SPSC ring buffer** — fixed-size, preallocated. The audio
+//!      callback (real-time thread) only does atomic head/tail loads + stores
+//!      and a memcpy. Zero allocator calls on the hot path. Drop-newest on
+//!      overflow with an atomic dropped-sample counter for diagnostics.
+//!
+//!   2. **Wakeup pipe** — the callback writes one non-blocking byte to a pipe
+//!      so a `poll()`-blocked consumer wakes the moment audio arrives. Removes
+//!      the 50 ms `usleep` polling floor that used to sit between mic capture
+//!      and VAD reaction. write(2) ≤ PIPE_BUF is atomic and real-time-safe;
+//!      EAGAIN (pipe already full) just means a wakeup is already pending —
+//!      ignore it.
 
 const std = @import("std");
 
@@ -15,6 +26,7 @@ pub const Error = error{
     AllocBufferFailed,
     EnqueueFailed,
     StartFailed,
+    PipeFailed,
 } || std.mem.Allocator.Error;
 
 // ---------- AudioQueue C ABI bindings ----------
@@ -119,27 +131,74 @@ pub const Capture = struct {
     allocator: std.mem.Allocator,
     queue: AudioQueueRef,
     buffers: [n_buffers]AudioQueueBufferRef,
-    ring: SampleRing,
     sample_rate: u32,
+
+    /// Pre-allocated SPSC ring (producer = audio callback; consumer = listen
+    /// loop). Indexed modulo `ring.len`. Sized to absorb a 30 s consumer
+    /// stall, which is way beyond anything we'd ever see in practice (drains
+    /// happen on every audio arrival, ~50 ms).
+    ring: []f32,
+    /// Producer cursor. Monotonically increasing — the producer is the only
+    /// one to advance it, the consumer reads with `.acquire`.
+    head: std.atomic.Value(usize),
+    /// Consumer cursor. Monotonically increasing — symmetric to `head`.
+    tail: std.atomic.Value(usize),
+    /// Total samples dropped due to overflow. Diagnostic only; surfaces in
+    /// `-v` when stopping.
+    overflow: std.atomic.Value(u64),
+
+    /// Wakeup pipe. `wakeup_w` is non-blocking; the callback writes 1 byte
+    /// after every successful ring write. The consumer `poll()`s `wakeup_r`
+    /// and drains it on each wakeup. EAGAIN on write means the pipe is
+    /// already saturated with a pending wakeup — that's fine, the consumer
+    /// will see the new data on its next drain anyway.
+    wakeup_r: c_int,
+    wakeup_w: c_int,
 
     const n_buffers = 3;
 
-    /// Buffer size: ~50 ms of audio. Smaller → lower latency in the listen
-    /// loop's drain rate; larger → fewer callbacks per second.
+    /// Buffer size: ~50 ms of audio per AudioQueue buffer. Small enough that
+    /// the consumer wakes promptly, large enough to keep callback rate low.
     const buffer_frames = 800; // 50 ms at 16 kHz
+
+    /// Ring depth: 30 s. Overflow only happens if the consumer hangs for
+    /// longer than that, which is a different kind of bug.
+    const ring_seconds = 30;
 
     pub fn start(allocator: std.mem.Allocator, sample_rate: u32) Error!*Capture {
         var self = try allocator.create(Capture);
         errdefer allocator.destroy(self);
 
+        const ring = try allocator.alloc(f32, ring_seconds * @as(usize, @intCast(sample_rate)));
+        errdefer allocator.free(ring);
+
+        var pipe_fds: [2]c_int = undefined;
+        if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
+        const wakeup_r = pipe_fds[0];
+        const wakeup_w = pipe_fds[1];
+        errdefer {
+            _ = std.c.close(wakeup_r);
+            _ = std.c.close(wakeup_w);
+        }
+        // O_NONBLOCK on both ends. Producer (callback): write must not block
+        // the real-time thread on a full pipe. Consumer (drain): reads after
+        // poll fires non-deterministic byte counts; non-block lets us loop
+        // until EAGAIN without a separate "how much" query.
+        try setNonBlocking(wakeup_r);
+        try setNonBlocking(wakeup_w);
+
         self.* = .{
             .allocator = allocator,
             .queue = null,
             .buffers = .{null} ** n_buffers,
-            .ring = .{ .mutex = .{}, .data = .empty },
             .sample_rate = sample_rate,
+            .ring = ring,
+            .head = .init(0),
+            .tail = .init(0),
+            .overflow = .init(0),
+            .wakeup_r = wakeup_r,
+            .wakeup_w = wakeup_w,
         };
-        errdefer self.ring.data.deinit(allocator);
 
         const fmt = AudioStreamBasicDescription{
             .mSampleRate = @floatFromInt(sample_rate),
@@ -171,43 +230,64 @@ pub const Capture = struct {
     pub fn stop(self: *Capture, allocator: std.mem.Allocator) void {
         _ = AudioQueueStop(self.queue, 1);
         _ = AudioQueueDispose(self.queue, 1);
-        self.ring.data.deinit(allocator);
+        _ = std.c.close(self.wakeup_r);
+        _ = std.c.close(self.wakeup_w);
+        allocator.free(self.ring);
         allocator.destroy(self);
     }
 
-    /// Move all currently-buffered samples into `dest`. Returns the number
-    /// pushed. Caller drives the consumption rate.
-    pub fn drain(self: *Capture, allocator: std.mem.Allocator, dest: *std.ArrayList(f32)) !usize {
-        self.ring.mutex.lock();
-        defer self.ring.mutex.unlock();
-        try dest.appendSlice(allocator, self.ring.data.items);
-        const n = self.ring.data.items.len;
-        self.ring.data.clearRetainingCapacity();
-        return n;
-    }
-};
-
-const SampleRing = struct {
-    mutex: SpinLock,
-    data: std.ArrayList(f32),
-};
-
-/// Tiny atomic spinlock. The audio callback and the consumer thread each hold
-/// it for ~microseconds, so contention is negligible. Avoids depending on
-/// std.Io.Mutex (which would require threading an Io reference through the
-/// CoreAudio callback path).
-const SpinLock = struct {
-    held: std.atomic.Value(bool) = .init(false),
-
-    fn lock(self: *SpinLock) void {
-        while (self.held.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-            std.atomic.spinLoopHint();
+    /// Block until audio is available, or `timeout_ms` elapses. The consumer
+    /// must call `drain` afterwards regardless of return value — `poll` can
+    /// return spuriously, and a wakeup may have been written between the
+    /// last drain and our `poll` entering the kernel.
+    pub fn waitForData(self: *Capture, timeout_ms: i32) void {
+        var fds = [_]std.posix.pollfd{
+            .{ .fd = self.wakeup_r, .events = std.c.POLL.IN, .revents = 0 },
+        };
+        _ = std.posix.poll(&fds, timeout_ms) catch {};
+        // Drain whatever bytes the callback wrote since last wake. Non-blocking,
+        // so EAGAIN naturally exits the loop. We don't care about the bytes
+        // themselves — they're just edge triggers.
+        var dump: [64]u8 = undefined;
+        while (true) {
+            const n = std.c.read(self.wakeup_r, &dump, dump.len);
+            if (n <= 0) break;
         }
     }
-    fn unlock(self: *SpinLock) void {
-        self.held.store(false, .release);
+
+    /// Move all currently-buffered samples into `dest`. Returns the number
+    /// pushed.
+    pub fn drain(self: *Capture, allocator: std.mem.Allocator, dest: *std.ArrayList(f32)) !usize {
+        const head = self.head.load(.acquire);
+        const tail = self.tail.load(.monotonic);
+        const n = head - tail;
+        if (n == 0) return 0;
+
+        try dest.ensureUnusedCapacity(allocator, n);
+        const cap = self.ring.len;
+        const start_idx = tail % cap;
+        const first_chunk = @min(n, cap - start_idx);
+        dest.appendSliceAssumeCapacity(self.ring[start_idx .. start_idx + first_chunk]);
+        if (first_chunk < n) {
+            dest.appendSliceAssumeCapacity(self.ring[0 .. n - first_chunk]);
+        }
+        self.tail.store(head, .release);
+        return n;
+    }
+
+    /// Total samples dropped due to ring overflow since `start`. Useful in
+    /// `-v` to surface a stuck consumer.
+    pub fn overflowSamples(self: *const Capture) u64 {
+        return self.overflow.load(.monotonic);
     }
 };
+
+fn setNonBlocking(fd: c_int) !void {
+    const cur = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+    if (cur < 0) return error.PipeFailed;
+    const nb_bit: c_int = 1 << @bitOffsetOf(std.posix.O, "NONBLOCK");
+    if (std.c.fcntl(fd, std.c.F.SETFL, cur | nb_bit) < 0) return error.PipeFailed;
+}
 
 fn callback(
     user_data: ?*anyopaque,
@@ -225,23 +305,37 @@ fn callback(
 
     if (buf.mAudioData) |data_ptr| {
         const n_samples = buf.mAudioDataByteSize / 4;
-        const samples: []const f32 = @as([*]const f32, @ptrCast(@alignCast(data_ptr)))[0..n_samples];
-        self.ring.mutex.lock();
-        // Bound the buffer so a stalled consumer doesn't grow it unbounded.
-        // 30 s of audio @ 16 kHz = 480 000 samples. Drop oldest beyond that.
-        const max_samples: usize = 30 * @as(usize, @intCast(self.sample_rate));
-        if (self.ring.data.items.len + n_samples > max_samples) {
-            const overflow = self.ring.data.items.len + n_samples - max_samples;
-            const remaining = self.ring.data.items.len - overflow;
-            std.mem.copyForwards(
-                f32,
-                self.ring.data.items[0..remaining],
-                self.ring.data.items[overflow..],
-            );
-            self.ring.data.shrinkRetainingCapacity(remaining);
+        const samples = @as([*]const f32, @ptrCast(@alignCast(data_ptr)))[0..n_samples];
+
+        // SPSC producer side. We are the only writer of `head`, so a
+        // monotonic load suffices for our own state. We need acquire on
+        // `tail` to see the consumer's progress and compute free space.
+        const head = self.head.load(.monotonic);
+        const tail = self.tail.load(.acquire);
+        const cap = self.ring.len;
+        const used = head - tail;
+        const free = if (used >= cap) 0 else cap - used;
+        const to_write = @min(n_samples, free);
+        const dropped = n_samples - to_write;
+
+        if (to_write > 0) {
+            const start_idx = head % cap;
+            const first_chunk = @min(to_write, cap - start_idx);
+            @memcpy(self.ring[start_idx .. start_idx + first_chunk], samples[0..first_chunk]);
+            if (first_chunk < to_write) {
+                @memcpy(self.ring[0 .. to_write - first_chunk], samples[first_chunk..to_write]);
+            }
+            // Release: publish the writes above to the consumer.
+            self.head.store(head + to_write, .release);
+
+            // Wake the consumer. Non-blocking; EAGAIN means a wakeup is
+            // already pending in the pipe — equally good.
+            const byte: u8 = 0;
+            _ = std.c.write(self.wakeup_w, @ptrCast(&byte), 1);
         }
-        self.ring.data.appendSlice(self.allocator, samples) catch {};
-        self.ring.mutex.unlock();
+        if (dropped > 0) {
+            _ = self.overflow.fetchAdd(@intCast(dropped), .monotonic);
+        }
     }
     _ = AudioQueueEnqueueBuffer(queue, buf, 0, null);
 }

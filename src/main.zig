@@ -66,7 +66,7 @@ const whisper_default_partial: WhisperModelSize = .tiny;
 
 // Silero VAD model on HF — ggml-format binaries maintained alongside whisper.cpp.
 const vad_repo = "ggml-org/whisper-vad";
-const vad_filename = "ggml-silero-v5.1.2.bin";
+const vad_filename = "ggml-silero-v6.2.0.bin";
 
 /// Tri-state result of parsing the `--backend` flag. `auto` is its own value
 /// — it triggers a language probe and then picks one of the real backends.
@@ -146,6 +146,7 @@ fn run(init: std.process.Init) !u8 {
         .model_pull => return modelPull(allocator, io, &env),
         .transcribe => |args| return transcribe(allocator, io, &env, args),
         .listen => |args| return listen(allocator, io, &env, args),
+        .bench_vad => |args| return benchVad(allocator, io, &env, args),
     }
 }
 
@@ -273,6 +274,8 @@ fn transcribe(
             if (!args.verbose) {
                 c.llama_log_set(quietLogCb, null);
                 c.mtmd_helper_log_set(quietLogCb, null);
+                c.whisper_log_set(quietLogCb, null);
+                c.ggml_log_set(quietLogCb, null);
             }
             const tiny_path = try resolveWhisperSizePath(allocator, io, env, .tiny);
             defer allocator.free(tiny_path);
@@ -319,6 +322,8 @@ fn transcribe(
     if (!args.verbose) {
         c.llama_log_set(quietLogCb, null);
         c.mtmd_helper_log_set(quietLogCb, null);
+        c.whisper_log_set(quietLogCb, null);
+        c.ggml_log_set(quietLogCb, null);
     }
 
     const whisper_size = blk: {
@@ -400,7 +405,6 @@ fn transcribe(
 
 var g_running: std.atomic.Value(bool) = .init(true);
 
-extern "c" fn usleep(usec: u32) c_int;
 extern "c" fn isatty(fd: c_int) c_int;
 
 fn sigintHandler(_: std.posix.SIG) callconv(.c) void {
@@ -438,6 +442,8 @@ fn listen(
     if (!args.verbose) {
         c.llama_log_set(quietLogCb, null);
         c.mtmd_helper_log_set(quietLogCb, null);
+        c.whisper_log_set(quietLogCb, null);
+        c.ggml_log_set(quietLogCb, null);
     }
 
     const whisper_size = blk: {
@@ -679,7 +685,9 @@ fn listen(
     var partial_iters: u32 = 0;
 
     while (g_running.load(.acquire)) {
-        _ = usleep(drain_ms * 1000);
+        // Wakeup pipe: returns ~immediately when audio arrives, falls back
+        // to drain_ms timeout to keep the partial-preview cadence ticking.
+        capture.waitForData(@intCast(drain_ms));
 
         pcm_buf.clearRetainingCapacity();
         _ = capture.drain(allocator, &pcm_buf) catch continue;
@@ -711,7 +719,183 @@ fn listen(
     }
 
     detector.flush(&ctx, onSegment) catch |err| errors.print("warn", err);
-    if (args.verbose) std.debug.print("\nstopped after {d} utterance(s)\n", .{ctx.utterance_id});
+    if (args.verbose) {
+        const dropped = capture.overflowSamples();
+        if (dropped > 0) std.debug.print(
+            "\nwarn: dropped {d} samples ({d} ms) due to ring overflow — consumer was lagging\n",
+            .{ dropped, dropped * 1000 / 16_000 },
+        );
+        std.debug.print("\nstopped after {d} utterance(s)\n", .{ctx.utterance_id});
+    }
+    return 0;
+}
+
+// ---------- bench-vad subcommand (hidden, used for v0.11 latency report) ----------
+
+/// Measures end-of-utterance commit latency of vad.Detector across several
+/// `silero_quick_silence_ms` settings on a given wav file. Pads the speech
+/// with 1.5 s of pure silence so the detector has clean tail to count from,
+/// then feeds the buffer frame-by-frame and records how many silero frames
+/// elapse between "speech ended" and "Detector committed the segment".
+/// Output is a tab-separated table; redirect to a file in `bench/results-...`.
+fn benchVad(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args: cli.BenchVadArgs,
+) !u8 {
+    // Silence whisper.cpp / ggml log spam so the bench output stays clean.
+    c.whisper_log_set(quietLogCb, null);
+    c.ggml_log_set(quietLogCb, null);
+
+    const silero_path = hf.ensureFile(allocator, io, env, .{
+        .repo = vad_repo,
+        .filename = vad_filename,
+    }) catch |err| {
+        errors.print("error", err);
+        return 2;
+    };
+    defer allocator.free(silero_path);
+    const silero_path_z = try allocator.dupeZ(u8, silero_path);
+    defer allocator.free(silero_path_z);
+
+    const decoded = asr.Wav.decodeFile(allocator, io, args.wav_path) catch |err| {
+        errors.print("error", err);
+        return 2;
+    };
+    defer decoded.deinit(allocator);
+
+    // Append 1.5 s of true silence so the silero confidence eventually
+    // collapses to ~0. (Real-room "silence" has ~−40 dBFS noise that keeps
+    // P(speech) higher; we want to characterize the detector logic in
+    // isolation, not mic conditions.)
+    const tail_ms: usize = 1500;
+    const tail_samples = (decoded.sample_rate * tail_ms) / 1000;
+    const buf = try allocator.alloc(f32, decoded.samples.len + tail_samples);
+    defer allocator.free(buf);
+    @memcpy(buf[0..decoded.samples.len], decoded.samples);
+    @memset(buf[decoded.samples.len..], 0);
+
+    const frame_size: usize = 512;
+    const frame_ms: usize = 32;
+
+    // Probe pass: run silero over the whole padded buffer, find the LAST
+    // frame where silero says voiced. That's our "true speech end" — an
+    // honest reference point for measuring end-of-utterance commit latency
+    // (vs. the wav's nominal end-of-buffer, which can land mid-syllable and
+    // bias silero's LSTM unwind).
+    const speech_end_frame: usize = blk: {
+        var probe = vad.SileroVoicer.open(
+            allocator,
+            silero_path_z,
+            0.5,
+            0.05,
+        ) catch |e| {
+            errors.print("error", e);
+            return 3;
+        };
+        defer probe.deinit();
+        var last_voiced: usize = 0;
+        var f: usize = 0;
+        var i: usize = 0;
+        while (i + frame_size <= buf.len) : (i += frame_size) {
+            const class = probe.classify(buf[i .. i + frame_size]);
+            if (class.voiced) last_voiced = f;
+            f += 1;
+        }
+        break :blk last_voiced;
+    };
+
+    // Single sustained streaming writer over stdout. The per-call
+    // `printStdout` helper opens a positional writer that resets to offset 0
+    // each call, which clobbers prior lines when stdout is redirected to a
+    // regular file — fine for the existing single-shot uses but wrong here.
+    var out_buf: [4096]u8 = undefined;
+    var out_w = std.Io.File.stdout().writerStreaming(io, &out_buf);
+    const out = &out_w.interface;
+    defer out.flush() catch {};
+
+    try out.print("wav: {s}\n", .{args.wav_path});
+    try out.print("  total samples       = {d} ({d} ms)\n", .{
+        decoded.samples.len,
+        (decoded.samples.len * 1000) / decoded.sample_rate,
+    });
+    try out.print("  silence pad         = {d} samples ({d} ms)\n", .{ tail_samples, tail_ms });
+    try out.print("  silero last-voiced  = frame {d} ({d} ms) — used as 'true speech end'\n", .{
+        speech_end_frame,
+        speech_end_frame * frame_ms,
+    });
+    try out.print("  frame size          = {d} samples ({d} ms @ silero)\n\n", .{ frame_size, frame_ms });
+    try out.print("quick_ms\tsafety_ms\tcommit_frame\tlatency_ms\tnote\n", .{});
+
+    // Three configs: quick disabled (= pre-v0.11 safety-only behavior), the
+    // 250 ms variant from the v0.11 draft, and the 400 ms post-bench default.
+    // Safety stays at 600 throughout.
+    const Cfg = struct { quick: u32, label: []const u8 };
+    const cfgs: []const Cfg = &.{
+        .{ .quick = 0, .label = "pre-v0.11 (safety only)" },
+        .{ .quick = 250, .label = "draft (too aggressive)" },
+        .{ .quick = 400, .label = "v0.11 default" },
+    };
+
+    for (cfgs) |cfg| {
+        // Setting silero_quick_silence_ms=0 makes the Detector compute
+        // quick_silence_frames=0 too, which the FSM treats as "no quick cut".
+        var detector = vad.Detector.init(allocator, .{
+            .backend = .silero,
+            .silero_model_path = silero_path_z,
+            .silero_quick_silence_ms = cfg.quick,
+            .silence_ms = 600,
+            .preroll_ms = 200,
+            .min_segment_ms = 300,
+        }) catch |err| {
+            errors.print("error", err);
+            return 3;
+        };
+        defer detector.deinit(allocator);
+
+        const Ctx = struct {
+            commit_frame: ?usize = null,
+            current_frame: usize = 0,
+        };
+        var ctx: Ctx = .{};
+
+        const onSeg = struct {
+            fn cb(c_ctx: *Ctx, _: []const f32) anyerror!void {
+                if (c_ctx.commit_frame == null) c_ctx.commit_frame = c_ctx.current_frame;
+            }
+        }.cb;
+
+        var i: usize = 0;
+        while (i + frame_size <= buf.len) : (i += frame_size) {
+            try detector.feed(allocator, buf[i .. i + frame_size], &ctx, onSeg);
+            ctx.current_frame += 1;
+            if (ctx.commit_frame != null) break;
+        }
+
+        if (ctx.commit_frame) |cf| {
+            // A commit BEFORE the speech-end frame means an inner-pause cut
+            // fired (the safety silence_run found a long-enough silent
+            // stretch within the speech itself). That's a different signal
+            // than end-of-utterance latency — flag it explicitly so we don't
+            // confuse "fast" with "premature".
+            if (cf < speech_end_frame) {
+                const into_ms = cf * frame_ms;
+                try out.print("{d}\t{d}\t{d}\tMID-SPEECH@{d}ms\t{s} — cut on inner pause, not utterance end\n", .{
+                    cfg.quick, @as(u32, 600), cf, into_ms, cfg.label,
+                });
+            } else {
+                const lag_ms = (cf - speech_end_frame) * frame_ms;
+                try out.print("{d}\t{d}\t{d}\t{d}\t{s}\n", .{
+                    cfg.quick, @as(u32, 600), cf, lag_ms, cfg.label,
+                });
+            }
+        } else {
+            try out.print("{d}\t{d}\tno-commit\t-\t{s}\n", .{
+                cfg.quick, @as(u32, 600), cfg.label,
+            });
+        }
+    }
     return 0;
 }
 
@@ -738,7 +922,7 @@ fn probeFirstUtterance(
     defer pcm_buf.deinit(allocator);
 
     while (g_running.load(.acquire)) {
-        _ = usleep(50 * 1000);
+        capture.waitForData(50);
         pcm_buf.clearRetainingCapacity();
         _ = capture.drain(allocator, &pcm_buf) catch continue;
         if (pcm_buf.items.len == 0) continue;

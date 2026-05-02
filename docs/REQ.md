@@ -16,8 +16,9 @@
 | **v0.7** | 5 档 whisper 模型 + 双模型 partial（tiny + main） | ✅ 通过（2026-05-02），见 [v0.7-report.md](./v0.7-report.md) |
 | **v0.8** | `--backend auto`：tiny 语言探针 → 中文 qwen3 / 其他 whisper | ✅ 通过（2026-05-02），见 [v0.8-report.md](./v0.8-report.md) |
 | **v0.9** | `listen --backend auto`：first-utterance probe，session 内 stick | ✅ 通过（2026-05-02），见 [v0.9-report.md](./v0.9-report.md) |
-| **v0.10** | std.http 替 curl 子进程 | ❌ 已尝试已回滚（2026-05-02），见 [v0.10-aborted-std-http.md](./v0.10-aborted-std-http.md)。Zig 0.16 std.http 在 macOS 有 IP-literal + dual-stack bug 阻塞，等 upstream 修。 |
-| **v0.11+** | mp3/m4a 格式、WER bench、多文件 batch | 未承诺 |
+| **v0.10** | std.http 替 curl 子进程 | ✅ 通过（2026-05-02 第二次尝试），见 [v0.10-std-http.md](./v0.10-std-http.md)。绕开 macOS std.http DNS bug：hf.zig 用 `Client.fetch`（域名 OK），server.zig 手撸 HTTP/1.1（仅接受 IP literal / `localhost`）。 |
+| **v0.11** | 实时音频路径优化（lock-free SPSC ring + wakeup pipe + adaptive silence cut） | ✅ 通过（2026-05-03），见 [v0.11-report.md](./v0.11-report.md)。bench 数据揭示 pre-v0.11 把 5–17 s 录音切成 2–4 段；v0.11 默认 400 ms quick-cut 让 4/4 样本句末干净 commit @ ~416 ms。 |
+| **v0.12+** | WER bench、多文件 batch、release 打包 | 未承诺 |
 
 ## 1. 目标（MVP）
 
