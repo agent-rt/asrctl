@@ -14,6 +14,10 @@ const repo = "ggml-org/Qwen3-ASR-0.6B-GGUF";
 const model_filename = "Qwen3-ASR-0.6B-Q8_0.gguf";
 const mmproj_filename = "mmproj-Qwen3-ASR-0.6B-Q8_0.gguf";
 
+// Silero VAD model on HF — ggml-format binaries maintained alongside whisper.cpp.
+const vad_repo = "ggml-org/whisper-vad";
+const vad_filename = "ggml-silero-v5.1.2.bin";
+
 /// Write to stdout. Use this for content the user is meant to capture / pipe
 /// (transcribed text, paths, versions). Diagnostics and errors go through
 /// `std.debug.print`, which writes to stderr.
@@ -242,10 +246,43 @@ fn listen(
     };
     defer session.close();
 
-    var detector = vad.Detector.init(.{
-        .threshold = args.threshold orelse 0.012,
+    const backend: vad.Backend = blk: {
+        if (args.vad) |s| {
+            if (std.mem.eql(u8, s, "energy")) break :blk .energy;
+            if (std.mem.eql(u8, s, "silero")) break :blk .silero;
+            std.debug.print("error: unknown --vad backend '{s}' (energy|silero)\n", .{s});
+            return 1;
+        }
+        break :blk .energy;
+    };
+
+    // Silero needs its model file; resolve and pass through.
+    var silero_path_owned: ?[:0]u8 = null;
+    defer if (silero_path_owned) |p| allocator.free(p);
+    const silero_model_path: ?[:0]const u8 = if (backend == .silero) blk: {
+        const p = hf.ensureFile(allocator, io, env, .{
+            .repo = vad_repo,
+            .filename = vad_filename,
+        }) catch |err| {
+            errors.print("error", err);
+            return 2;
+        };
+        defer allocator.free(p);
+        const z = try allocator.dupeZ(u8, p);
+        silero_path_owned = z;
+        break :blk z;
+    } else null;
+
+    var detector = vad.Detector.init(allocator, .{
+        .backend = backend,
+        .energy_threshold = args.threshold orelse 0.012,
+        .silero_threshold = args.threshold orelse 0.5,
+        .silero_model_path = silero_model_path,
         .silence_ms = args.silence_ms orelse 600,
-    });
+    }) catch |err| {
+        errors.print("error", err);
+        return 3;
+    };
     defer detector.deinit(allocator);
 
     const capture = audio.Capture.start(allocator, 16_000) catch |err| {

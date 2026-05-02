@@ -19,6 +19,7 @@ pub const Subcommand = union(enum) {
 pub const ListenArgs = struct {
     output_path: ?[]const u8 = null,
     model_path: ?[]const u8 = null,
+    vad: ?[]const u8 = null, // "energy" | "silero"
     threads: ?i32 = null,
     threshold: ?f32 = null,
     silence_ms: ?u32 = null,
@@ -62,7 +63,8 @@ pub const usage_text =
     \\Listen options (asrctl listen):
     \\  -o, --output PATH    append each utterance to file instead of stdout
     \\      --model PATH     override model gguf path
-    \\      --threshold F    VAD RMS threshold (default 0.012)
+    \\      --vad BACKEND    VAD backend: energy (default) | silero
+    \\      --threshold F    VAD threshold (energy: RMS 0..1, silero: P 0..1)
     \\      --silence-ms N   silence duration that ends an utterance (default 600)
     \\      --threads N      CPU threads (default 4)
     \\  -v, --verbose        print VAD/timing info to stderr
@@ -120,6 +122,10 @@ fn parseListen(rest: []const [*:0]const u8) ParseError!Subcommand {
             i += 1;
             if (i >= rest.len) return error.MissingValue;
             args.threads = try std.fmt.parseInt(i32, std.mem.span(rest[i]), 10);
+        } else if (std.mem.eql(u8, a, "--vad")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.vad = std.mem.span(rest[i]);
         } else if (std.mem.eql(u8, a, "--threshold")) {
             i += 1;
             if (i >= rest.len) return error.MissingValue;

@@ -61,10 +61,15 @@ pub fn friendly(err: anyerror) Diagnostic {
             .hint = "is the server actually serving Qwen3-ASR?",
         },
 
-        // backend.zig
-        error.NoBackendsFound => .{
-            .summary = "could not locate ggml backend dylibs",
-            .hint = "expected /opt/homebrew/opt/ggml/libexec; try `brew install ggml`",
+        // vad.zig
+        error.SileroLoadFailed => .{
+            .summary = "could not load silero VAD model",
+            .hint = "try `asrctl model pull` to redownload, or omit --vad silero",
+        },
+        error.SileroInferenceFailed => .{ .summary = "silero VAD inference failed" },
+        error.SileroNotImplemented => .{
+            .summary = "silero VAD backend is not yet implemented",
+            .hint = "use --vad energy (default) for now; silero lands in v0.3.1",
         },
 
         // generic

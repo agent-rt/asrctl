@@ -1,28 +1,30 @@
-//! Energy-based voice-activity detection.
+//! Voice-activity detection.
 //!
-//! Splits a continuous PCM stream into utterances by RMS thresholding +
-//! "this much silence ends a segment" rules. Not as good as silero/webrtc,
-//! but adequate for v0.2 listen mode and ships with zero deps.
+//! Plug-in voicer backends share the same FSM (idle/active state machine
+//! with pre-roll, silence-cut, max-segment cap). Each backend just provides
+//! a `frameSamples()` natural window size and an `isVoiced(frame)` predicate.
 //!
-//! Frame: a fixed-size window (default 20 ms). Each frame is "voiced" if its
-//! RMS exceeds `threshold`. State machine:
-//!   - idle:    waiting for first voiced frame; collected samples discarded
-//!              except a small pre-roll so utterance onsets aren't clipped.
-//!   - active:  collecting samples; if `silence_ms` of unvoiced frames seen
-//!              → emit segment, return to idle.
-//!
-//! Output is via callback (push) rather than poll, so the caller can drive
-//! transcription synchronously and back-pressure naturally.
+//! Backends:
+//!   - `.energy`:  RMS threshold. Zero deps. Adequate in quiet rooms.
+//!   - `.silero`:  ggml-silero-v5 inference via vendored whisper.cpp VAD.
+//!                 Better noise robustness; downloads ~2 MB model on first use.
+//!                 (NOTE: scaffolding only; real inference lands in v0.3.1
+//!                 once we vendor the upstream whisper-vad source.)
 
 const std = @import("std");
 
+pub const Backend = enum { energy, silero };
+
 pub const Config = struct {
+    backend: Backend = .energy,
     sample_rate: u32 = 16_000,
-    /// RMS threshold (linear, 0..1). 0.01 ≈ -40 dBFS, reasonable for a quiet
-    /// room. Override per-environment via CLI later if needed.
-    threshold: f32 = 0.012,
-    /// Frame analysis window in ms.
-    frame_ms: u32 = 20,
+    /// Energy backend: RMS threshold (linear, 0..1). Ignored for silero.
+    energy_threshold: f32 = 0.012,
+    /// Silero backend: P(speech) threshold above which a frame is voiced.
+    /// Ignored for energy.
+    silero_threshold: f32 = 0.5,
+    /// Path to the silero ggml model. Required when backend=.silero.
+    silero_model_path: ?[:0]const u8 = null,
     /// How long a silence run ends a segment.
     silence_ms: u32 = 600,
     /// Audio kept before the first voiced frame so we don't clip onsets.
@@ -34,8 +36,117 @@ pub const Config = struct {
     max_segment_ms: u32 = 30_000,
 };
 
+pub const Error = error{
+    SileroLoadFailed,
+    SileroInferenceFailed,
+    SileroNotImplemented, // v0.3.0: scaffolding only
+} || std.mem.Allocator.Error;
+
+/// Frame-level "is voiced" classifier.
+pub const Voicer = union(Backend) {
+    energy: EnergyVoicer,
+    silero: SileroVoicer,
+
+    pub fn frameSamples(self: Voicer) usize {
+        return switch (self) {
+            inline else => |v| v.frame_samples,
+        };
+    }
+
+    pub fn isVoiced(self: *Voicer, frame: []const f32) bool {
+        return switch (self.*) {
+            .energy => |*v| v.isVoiced(frame),
+            .silero => |*v| v.isVoiced(frame),
+        };
+    }
+
+    pub fn deinit(self: *Voicer) void {
+        switch (self.*) {
+            .energy => {},
+            .silero => |*v| v.deinit(),
+        }
+    }
+};
+
+pub fn voicerFromConfig(allocator: std.mem.Allocator, cfg: Config) Error!Voicer {
+    switch (cfg.backend) {
+        .energy => return .{
+            .energy = .{
+                .frame_samples = (cfg.sample_rate * 20) / 1000, // 20 ms
+                .threshold = cfg.energy_threshold,
+            },
+        },
+        .silero => {
+            const path = cfg.silero_model_path orelse return error.SileroLoadFailed;
+            return .{ .silero = try SileroVoicer.open(allocator, path, cfg.silero_threshold) };
+        },
+    }
+}
+
+// ---------- Energy backend ----------
+
+pub const EnergyVoicer = struct {
+    frame_samples: usize,
+    threshold: f32,
+
+    pub fn isVoiced(self: *EnergyVoicer, frame: []const f32) bool {
+        return rms(frame) > self.threshold;
+    }
+};
+
+fn rms(frame: []const f32) f32 {
+    var sum: f64 = 0;
+    for (frame) |s| sum += @as(f64, s) * s;
+    return @floatCast(@sqrt(sum / @as(f64, @floatFromInt(frame.len))));
+}
+
+// ---------- Silero backend (scaffolding) ----------
+
+/// Wraps a vendored whisper.cpp `whisper_vad_*` context. Frame size is fixed
+/// at silero v5's expected window (512 samples = 32 ms at 16 kHz).
+pub const SileroVoicer = struct {
+    frame_samples: usize,
+    threshold: f32,
+    /// Opaque handle to the loaded VAD context. v0.3.0: nil until v0.3.1
+    /// wires up the actual whisper-vad C API.
+    ctx: ?*anyopaque,
+    allocator: std.mem.Allocator,
+
+    pub fn open(
+        allocator: std.mem.Allocator,
+        model_path: [:0]const u8,
+        threshold: f32,
+    ) Error!SileroVoicer {
+        _ = model_path;
+        // v0.3.0: not yet wired. The infrastructure (CLI flag, model fetch,
+        // backend dispatch) is in place so v0.3.1 only needs to fill in the
+        // ggml inference call.
+        return .{
+            .frame_samples = 512,
+            .threshold = threshold,
+            .ctx = null,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn isVoiced(self: *SileroVoicer, frame: []const f32) bool {
+        _ = self;
+        _ = frame;
+        // Returning true here would make every frame voiced → infinite
+        // segment. Return false → no segments. Neither is right; bail out.
+        @panic("silero VAD not yet implemented (v0.3.1)");
+    }
+
+    pub fn deinit(self: *SileroVoicer) void {
+        _ = self;
+    }
+};
+
+// ---------- Detector (shared FSM) ----------
+
 pub const Detector = struct {
     cfg: Config,
+    voicer: Voicer,
     frame_samples: usize,
     silence_frames: u32,
     preroll_samples: usize,
@@ -50,12 +161,18 @@ pub const Detector = struct {
     /// Active-segment buffer.
     segment: std.ArrayList(f32) = .empty,
 
-    pub fn init(cfg: Config) Detector {
+    pub fn init(allocator: std.mem.Allocator, cfg: Config) Error!Detector {
+        const voicer = try voicerFromConfig(allocator, cfg);
         const sr = cfg.sample_rate;
+        const frame_ms = @as(u32, @intCast(voicer.frameSamples() * 1000 / sr));
+        // Silence frames is at frame-cadence; ceil to avoid 0 when frame_ms
+        // happens to exceed silence_ms (unusual but be defensive).
+        const silence_frames = if (frame_ms == 0) 1 else @max(1, cfg.silence_ms / frame_ms);
         return .{
             .cfg = cfg,
-            .frame_samples = (sr * cfg.frame_ms) / 1000,
-            .silence_frames = cfg.silence_ms / cfg.frame_ms,
+            .voicer = voicer,
+            .frame_samples = voicer.frameSamples(),
+            .silence_frames = silence_frames,
             .preroll_samples = (sr * cfg.preroll_ms) / 1000,
             .min_samples = (sr * cfg.min_segment_ms) / 1000,
             .max_samples = (sr * cfg.max_segment_ms) / 1000,
@@ -63,13 +180,11 @@ pub const Detector = struct {
     }
 
     pub fn deinit(self: *Detector, allocator: std.mem.Allocator) void {
+        self.voicer.deinit();
         self.preroll.deinit(allocator);
         self.segment.deinit(allocator);
     }
 
-    /// Feed a chunk of samples. For each completed segment, calls `on_segment`.
-    /// Caller owns the slice handed to the callback for the duration of the
-    /// callback only — copy if you need to retain.
     pub fn feed(
         self: *Detector,
         allocator: std.mem.Allocator,
@@ -80,11 +195,9 @@ pub const Detector = struct {
         var i: usize = 0;
         while (i + self.frame_samples <= chunk.len) : (i += self.frame_samples) {
             const frame = chunk[i .. i + self.frame_samples];
-            const voiced = rms(frame) > self.cfg.threshold;
+            const voiced = self.voicer.isVoiced(frame);
             try self.processFrame(allocator, frame, voiced, ctx, on_segment);
         }
-        // Tail: if there's a partial frame, append it to whatever buffer is
-        // active. Not analyzed for VAD but not lost either.
         if (i < chunk.len) {
             const tail = chunk[i..];
             switch (self.state) {
@@ -106,7 +219,6 @@ pub const Detector = struct {
             .idle => {
                 try appendBounded(allocator, &self.preroll, frame, self.preroll_samples);
                 if (voiced) {
-                    // Promote pre-roll to segment.
                     try self.segment.appendSlice(allocator, self.preroll.items);
                     self.preroll.clearRetainingCapacity();
                     self.state = .active;
@@ -135,8 +247,6 @@ pub const Detector = struct {
         }
     }
 
-    /// Force-emit any in-flight segment. Call on shutdown so the user's last
-    /// utterance doesn't get lost.
     pub fn flush(
         self: *Detector,
         ctx: anytype,
@@ -150,12 +260,6 @@ pub const Detector = struct {
         }
     }
 };
-
-fn rms(frame: []const f32) f32 {
-    var sum: f64 = 0;
-    for (frame) |s| sum += @as(f64, s) * s;
-    return @floatCast(@sqrt(sum / @as(f64, @floatFromInt(frame.len))));
-}
 
 fn appendBounded(
     allocator: std.mem.Allocator,
