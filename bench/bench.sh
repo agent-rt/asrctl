@@ -63,11 +63,13 @@ run_sample() {
   dur=$(duration_ms "$wav")
   echo
   echo "$label  ($wav, ${dur} ms audio)"
-  run_once "  cold (in-process)" "$ASRCTL" "$wav"
-  run_once "  warm (in-process)" "$ASRCTL" "$wav"
+  run_once "  qwen3   cold"  "$ASRCTL" --backend qwen3   "$wav"
+  run_once "  qwen3   warm"  "$ASRCTL" --backend qwen3   "$wav"
+  run_once "  whisper cold"  "$ASRCTL" --backend whisper "$wav"
+  run_once "  whisper warm"  "$ASRCTL" --backend whisper "$wav"
   if [[ -n $SERVER_URL ]]; then
-    run_once "  cold (server)    " "$ASRCTL" --server-url "$SERVER_URL" "$wav"
-    run_once "  warm (server)    " "$ASRCTL" --server-url "$SERVER_URL" "$wav"
+    run_once "  qwen3   server cold" "$ASRCTL" --server-url "$SERVER_URL" "$wav"
+    run_once "  qwen3   server warm" "$ASRCTL" --server-url "$SERVER_URL" "$wav"
   fi
 }
 

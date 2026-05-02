@@ -75,6 +75,32 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Decoded {
     };
 }
 
+/// io-less file decode via posix syscalls. Used by Session paths that don't
+/// thread an `Io` through (e.g. WhisperSession.transcribeFile).
+pub fn decodeFileSimple(allocator: std.mem.Allocator, path: []const u8) !Decoded {
+    var path_buf: [4096]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY }); // O_RDONLY
+    if (fd < 0) return error.Truncated;
+    defer _ = std.c.close(fd);
+
+    const off_end = std.c.lseek(fd, 0, 2); // SEEK_END
+    if (off_end < 0) return error.Truncated;
+    _ = std.c.lseek(fd, 0, 0); // SEEK_SET
+
+    const size: usize = @intCast(off_end);
+    const buf = try allocator.alloc(u8, size);
+    defer allocator.free(buf);
+
+    var read_total: usize = 0;
+    while (read_total < size) {
+        const n = std.c.read(fd, buf.ptr + read_total, size - read_total);
+        if (n <= 0) break;
+        read_total += @intCast(n);
+    }
+    return decode(allocator, buf[0..read_total]);
+}
+
 pub fn decodeFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Decoded {
     const cwd = std.Io.Dir.cwd();
     var file = try cwd.openFile(io, path, .{});

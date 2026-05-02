@@ -1,18 +1,20 @@
-//! Transcription pipeline.
+//! Transcription pipeline with two backends:
+//!   - `.qwen3`:   Qwen3-ASR-0.6B via llama.cpp + mtmd. Strong multilingual,
+//!                 best Chinese performance, 1.5 GB total (model + mmproj).
+//!   - `.whisper`: whisper.cpp + ggml-large-v3-turbo (Q5_0). OpenAI SOTA,
+//!                 streaming-capable transcription, ~547 MB.
 //!
-//! Two entry points:
-//!   - `Session` — load model + mtmd + sampler once, transcribe many segments.
-//!     Used by `asrctl listen` (v0.2 real-time).
-//!   - `transcribe()` — one-shot helper for `asrctl transcribe <wav>`. Internally
-//!     just wraps Session.
+//! Both expose the same `Session` shape so callers don't care which is loaded.
+//! `transcribe()` is a one-shot wrapper for `asrctl <wav>`. `Session.open` /
+//! `transcribePCM` is what `asrctl listen` drives across utterances.
 //!
-//! Audio input is always raw f32 PCM at the model's expected sample rate
-//! (typically 16 kHz). For wav files, the caller decodes via wav.zig first;
-//! for the real-time path, the audio capture layer feeds PCM directly.
+//! Audio in is always mono f32 PCM at 16 kHz.
 
 const std = @import("std");
 const c = @import("c");
 const wav = @import("wav.zig");
+
+pub const Backend = enum { qwen3, whisper };
 
 pub const Error = error{
     LoadModelFailed,
@@ -22,6 +24,7 @@ pub const Error = error{
     TokenizeFailed,
     EvalChunksFailed,
     DecodeFailed,
+    WhisperFullFailed,
     OutOfMemory,
     UnsupportedFormat,
     UnsupportedChannelCount,
@@ -30,19 +33,26 @@ pub const Error = error{
 };
 
 pub const Options = struct {
+    backend: Backend = .qwen3,
+    /// Qwen3 main model.
     model_path: [:0]const u8,
-    mmproj_path: [:0]const u8,
+    /// Qwen3 mmproj. Ignored for `.whisper`.
+    mmproj_path: ?[:0]const u8 = null,
     n_threads: i32 = 4,
     n_ctx: u32 = 4096,
     max_tokens: usize = 256,
+    /// Whisper language code ("auto" / "en" / "zh" / ...). Only used by .whisper.
+    language: ?[:0]const u8 = null,
 };
 
 pub const Result = struct {
-    /// Parsed transcription text (after `<asr_text>` marker).
+    /// Parsed transcription text.
     text: []u8,
-    /// Detected language (between "language " and "<asr_text>"), may be empty.
+    /// Detected language for Qwen3 (from "<asr_text>" header). Whisper sets
+    /// this from `whisper_full_lang_id`-style call when available.
     language: []u8,
-    /// Raw model output for debugging.
+    /// Raw model output for debugging. For Qwen3 this is the unparsed
+    /// "language X<asr_text>Y" string; for whisper it equals `text`.
     raw: []u8,
 
     pub fn deinit(self: Result, allocator: std.mem.Allocator) void {
@@ -52,7 +62,42 @@ pub const Result = struct {
     }
 };
 
-pub const Session = struct {
+pub const Session = union(Backend) {
+    qwen3: Qwen3Session,
+    whisper: WhisperSession,
+
+    pub fn open(allocator: std.mem.Allocator, opts: Options) Error!Session {
+        return switch (opts.backend) {
+            .qwen3 => .{ .qwen3 = try Qwen3Session.open(allocator, opts) },
+            .whisper => .{ .whisper = try WhisperSession.open(allocator, opts) },
+        };
+    }
+
+    pub fn close(self: *Session) void {
+        switch (self.*) {
+            .qwen3 => |*s| s.close(),
+            .whisper => |*s| s.close(),
+        }
+    }
+
+    pub fn transcribePCM(self: *Session, samples: []const f32) Error!Result {
+        return switch (self.*) {
+            .qwen3 => |*s| s.transcribePCM(samples),
+            .whisper => |*s| s.transcribePCM(samples),
+        };
+    }
+
+    pub fn transcribeFile(self: *Session, path: [:0]const u8) Error!Result {
+        return switch (self.*) {
+            .qwen3 => |*s| s.transcribeFile(path),
+            .whisper => |*s| s.transcribeFile(path),
+        };
+    }
+};
+
+// ---------- Qwen3 backend (llama.cpp + mtmd) ----------
+
+pub const Qwen3Session = struct {
     allocator: std.mem.Allocator,
     model: *c.llama_model,
     lctx: *c.llama_context,
@@ -62,7 +107,7 @@ pub const Session = struct {
     n_batch: i32,
     max_tokens: usize,
 
-    pub fn open(allocator: std.mem.Allocator, opts: Options) Error!Session {
+    pub fn open(allocator: std.mem.Allocator, opts: Options) Error!Qwen3Session {
         c.llama_backend_init();
         errdefer c.llama_backend_free();
 
@@ -81,12 +126,13 @@ pub const Session = struct {
             return error.InitContextFailed;
         errdefer c.llama_free(lctx);
 
+        const mmproj = opts.mmproj_path orelse return error.InitMtmdFailed;
         var mtmd_params = c.mtmd_context_params_default();
         mtmd_params.use_gpu = true;
         mtmd_params.print_timings = false;
         mtmd_params.n_threads = opts.n_threads;
         mtmd_params.warmup = false;
-        const mctx = c.mtmd_init_from_file(opts.mmproj_path.ptr, model, mtmd_params) orelse
+        const mctx = c.mtmd_init_from_file(mmproj.ptr, model, mtmd_params) orelse
             return error.InitMtmdFailed;
         errdefer c.mtmd_free(mctx);
 
@@ -109,7 +155,7 @@ pub const Session = struct {
         };
     }
 
-    pub fn close(self: *Session) void {
+    pub fn close(self: *Qwen3Session) void {
         c.llama_sampler_free(self.smpl);
         c.mtmd_free(self.mctx);
         c.llama_free(self.lctx);
@@ -117,26 +163,21 @@ pub const Session = struct {
         c.llama_backend_free();
     }
 
-    /// Transcribe a buffer of mono f32 PCM samples. Resets the KV cache + the
-    /// sampler so each call is independent.
-    pub fn transcribePCM(self: *Session, samples: []const f32) Error!Result {
+    pub fn transcribePCM(self: *Qwen3Session, samples: []const f32) Error!Result {
         const bitmap = c.mtmd_bitmap_init_from_audio(samples.len, samples.ptr) orelse
             return error.LoadAudioFailed;
         defer c.mtmd_bitmap_free(bitmap);
         return self.transcribeBitmap(bitmap);
     }
 
-    /// File path entry point used by the one-shot `asrctl transcribe` command.
-    /// Lets mtmd's bundled miniaudio handle wav/mp3/flac decoding.
-    pub fn transcribeFile(self: *Session, path: [:0]const u8) Error!Result {
+    pub fn transcribeFile(self: *Qwen3Session, path: [:0]const u8) Error!Result {
         const bitmap = c.mtmd_helper_bitmap_init_from_file(self.mctx, path.ptr) orelse
             return error.LoadAudioFailed;
         defer c.mtmd_bitmap_free(bitmap);
         return self.transcribeBitmap(bitmap);
     }
 
-    fn transcribeBitmap(self: *Session, bitmap: *c.mtmd_bitmap) Error!Result {
-        // Fresh KV cache for each segment so previous utterances don't bleed in.
+    fn transcribeBitmap(self: *Qwen3Session, bitmap: *c.mtmd_bitmap) Error!Result {
         c.llama_memory_clear(c.llama_get_memory(self.lctx), true);
         c.llama_sampler_reset(self.smpl);
 
@@ -196,25 +237,13 @@ pub const Session = struct {
         }
 
         const raw_owned = try raw.toOwnedSlice(self.allocator);
-        return parseOutput(self.allocator, raw_owned);
+        return parseQwen3Output(self.allocator, raw_owned);
     }
 };
 
-/// One-shot helper: open a session, transcribe a file, close. Used by the
-/// non-interactive `transcribe` subcommand.
-pub fn transcribe(
-    allocator: std.mem.Allocator,
-    opts: Options,
-    audio_path: [:0]const u8,
-) Error!Result {
-    var session = try Session.open(allocator, opts);
-    defer session.close();
-    return session.transcribeFile(audio_path);
-}
-
 /// Parses Qwen3-ASR's `language X<asr_text>Y` output into a Result. Takes
-/// ownership of `raw`. Shared by both in-process and HTTP server paths.
-pub fn parseOutput(allocator: std.mem.Allocator, raw: []u8) !Result {
+/// ownership of `raw`. Shared with the HTTP server path.
+pub fn parseQwen3Output(allocator: std.mem.Allocator, raw: []u8) !Result {
     const tag = "<asr_text>";
     var lang_owned: []u8 = &.{};
     var text_owned: []u8 = &.{};
@@ -234,5 +263,103 @@ pub fn parseOutput(allocator: std.mem.Allocator, raw: []u8) !Result {
     return .{ .text = text_owned, .language = lang_owned, .raw = raw };
 }
 
-// Re-export for callers that want the wav decoder.
+// Backwards-compat alias for server.zig.
+pub const parseOutput = parseQwen3Output;
+
+// ---------- Whisper backend (whisper.cpp) ----------
+
+pub const WhisperSession = struct {
+    allocator: std.mem.Allocator,
+    ctx: *c.whisper_context,
+    n_threads: i32,
+    language: ?[:0]const u8,
+
+    pub fn open(allocator: std.mem.Allocator, opts: Options) Error!WhisperSession {
+        var cparams = c.whisper_context_default_params();
+        cparams.use_gpu = true;
+        cparams.flash_attn = true;
+        const ctx = c.whisper_init_from_file_with_params(opts.model_path.ptr, cparams) orelse
+            return error.LoadModelFailed;
+        return .{
+            .allocator = allocator,
+            .ctx = ctx,
+            .n_threads = opts.n_threads,
+            .language = opts.language,
+        };
+    }
+
+    pub fn close(self: *WhisperSession) void {
+        c.whisper_free(self.ctx);
+    }
+
+    pub fn transcribePCM(self: *WhisperSession, samples: []const f32) Error!Result {
+        var fparams = c.whisper_full_default_params(c.WHISPER_SAMPLING_GREEDY);
+        fparams.print_progress = false;
+        fparams.print_special = false;
+        fparams.print_realtime = false;
+        fparams.print_timestamps = false;
+        fparams.translate = false;
+        fparams.n_threads = self.n_threads;
+        fparams.no_context = true; // independent utterances
+        fparams.single_segment = false;
+        fparams.suppress_blank = true;
+        fparams.no_timestamps = true;
+        // Default whisper sometimes emits "[BLANK_AUDIO]" / language tags etc;
+        // suppress_non_speech_tokens trims most.
+        fparams.suppress_nst = true;
+        if (self.language) |lang| {
+            fparams.language = lang.ptr;
+        } else {
+            fparams.language = "auto";
+        }
+
+        if (c.whisper_full(self.ctx, fparams, samples.ptr, @intCast(samples.len)) != 0)
+            return error.WhisperFullFailed;
+
+        // Concatenate all segment texts.
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+
+        const n = c.whisper_full_n_segments(self.ctx);
+        var i: c_int = 0;
+        while (i < n) : (i += 1) {
+            const seg = c.whisper_full_get_segment_text(self.ctx, i);
+            if (seg) |s| {
+                const slice = std.mem.span(s);
+                // Whisper segments often start with a leading space.
+                try out.appendSlice(self.allocator, slice);
+            }
+        }
+
+        const text_owned = try self.allocator.dupe(u8, std.mem.trim(u8, out.items, " \n"));
+        const raw_owned = try out.toOwnedSlice(self.allocator);
+
+        // Detected language id → string.
+        const lang_id = c.whisper_full_lang_id(self.ctx);
+        const lang_str = c.whisper_lang_str(lang_id);
+        const lang_owned = try self.allocator.dupe(u8, std.mem.span(lang_str));
+
+        return .{ .text = text_owned, .language = lang_owned, .raw = raw_owned };
+    }
+
+    pub fn transcribeFile(self: *WhisperSession, path: [:0]const u8) Error!Result {
+        const decoded = wav.decodeFileSimple(self.allocator, std.mem.span(path.ptr)) catch
+            return error.LoadAudioFailed;
+        defer decoded.deinit(self.allocator);
+        return self.transcribePCM(decoded.samples);
+    }
+};
+
+// ---------- one-shot helper ----------
+
+pub fn transcribe(
+    allocator: std.mem.Allocator,
+    opts: Options,
+    audio_path: [:0]const u8,
+) Error!Result {
+    var session = try Session.open(allocator, opts);
+    defer session.close();
+    return session.transcribeFile(audio_path);
+}
+
 pub const Wav = wav;

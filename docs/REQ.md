@@ -10,7 +10,8 @@
 | **MVP (v0.1)** | 本地 `.wav` 文件 → 文本，进程内 + llama-server 备用 | 当前文档 |
 | **v0.2** | 实时音频（麦克风流式 ASR） | ✅ 已通过（2026-05-02），见 [v0.2-report.md](./v0.2-report.md) |
 | **v0.3** | silero 神经 VAD 替代能量 VAD | ✅ 通过（2026-05-02），见 [v0.3-report.md](./v0.3-report.md) |
-| **v0.4+** | mp3/m4a/flac 等额外格式、字幕输出、Linux 支持 | 未承诺 |
+| **v0.4** | 双 ASR 后端（Qwen3 + whisper-large-v3-turbo） | ✅ 通过（2026-05-02），见 [v0.4-report.md](./v0.4-report.md) |
+| **v0.5+** | streaming partial words、mp3/m4a 格式、Linux 支持 | 未承诺 |
 
 ## 1. 目标（MVP）
 

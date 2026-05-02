@@ -1,15 +1,23 @@
 # asrctl
 
-A small Zig CLI that turns `.wav` audio into text on Apple Silicon, using
-[Qwen3-ASR-0.6B](https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF) via
-[llama.cpp](https://github.com/ggml-org/llama.cpp)'s `mtmd` (multimodal) module
-on the Metal backend.
+A small Zig CLI that turns audio into text on macOS Apple Silicon, with
+**two state-of-the-art ASR backends in a single 6 MB static binary**:
+
+- **Qwen3-ASR-0.6B** (Alibaba 2026, multilingual SOTA, especially Chinese)
+  via [llama.cpp](https://github.com/ggml-org/llama.cpp) + `mtmd`
+- **Whisper-large-v3-turbo Q5_0** (OpenAI multilingual SOTA)
+  via vendored [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
+
+Same CLI for both backends. Real-time microphone (`asrctl listen`), neural
+silero VAD, llama-server fallback. No Python.
 
 ```sh
-asrctl audio.wav            # → stdout
-asrctl audio.wav -o out.txt # → file
-asrctl --server-url http://127.0.0.1:8080 audio.wav   # forward to llama-server
-asrctl listen               # mic → text stream (Ctrl-C to stop)
+asrctl audio.wav                          # → stdout, default qwen3 backend
+asrctl --backend whisper audio.wav        # use whisper-large-v3-turbo
+asrctl audio.wav -o out.txt               # → file
+asrctl --server-url http://127.0.0.1:8080 audio.wav   # qwen3 via llama-server
+asrctl listen                             # mic → text stream (Ctrl-C to stop)
+asrctl listen --backend whisper --vad silero  # full SOTA stack
 ```
 
 EN: 5 s wav → ~1.2 s wall time. ZH: same. See [`bench/`](bench/).
@@ -19,7 +27,20 @@ EN: 5 s wav → ~1.2 s wall time. ZH: same. See [`bench/`](bench/).
 - ✅ v0.1: wav transcription, in-process + llama-server fallback.
 - ✅ v0.2: real-time microphone streaming via `asrctl listen`.
 - ✅ v0.3: silero neural VAD via vendored whisper.cpp (`--vad silero`).
+- ✅ v0.4: dual ASR backends — Qwen3-ASR + whisper-large-v3-turbo
+  (`--backend qwen3|whisper`).
 - See [`docs/REQ.md`](docs/REQ.md) for the full requirements & milestones.
+
+## Backend comparison
+
+| | Qwen3-ASR (default) | Whisper-large-v3-turbo |
+| --- | --- | --- |
+| Repo | `ggml-org/Qwen3-ASR-0.6B-GGUF` | `ggerganov/whisper.cpp` |
+| Disk | ~1.5 GB (model + mmproj) | ~547 MB (Q5_0) |
+| 5s wav (warm) | ~1.2 s | ~2.2 s |
+| 17s wav (warm) | ~1.7 s | ~2.2 s |
+| Strengths | Faster; Chinese; full-width punctuation | LM context recovery; less hallucination on phonetics |
+| Server fallback | ✅ via `--server-url` | ❌ (no llama-server equivalent) |
 
 ## Limitations
 

@@ -10,13 +10,26 @@ const vad = @import("vad.zig");
 
 const version = "0.0.1";
 
-const repo = "ggml-org/Qwen3-ASR-0.6B-GGUF";
-const model_filename = "Qwen3-ASR-0.6B-Q8_0.gguf";
-const mmproj_filename = "mmproj-Qwen3-ASR-0.6B-Q8_0.gguf";
+// Default Qwen3-ASR model (backend=qwen3).
+const qwen3_repo = "ggml-org/Qwen3-ASR-0.6B-GGUF";
+const qwen3_model_filename = "Qwen3-ASR-0.6B-Q8_0.gguf";
+const qwen3_mmproj_filename = "mmproj-Qwen3-ASR-0.6B-Q8_0.gguf";
+
+// Default whisper model (backend=whisper). large-v3-turbo Q5_0: 547 MB,
+// multilingual SOTA, ~30x realtime on Apple Silicon. Override via --model.
+const whisper_repo = "ggerganov/whisper.cpp";
+const whisper_model_filename = "ggml-large-v3-turbo-q5_0.bin";
 
 // Silero VAD model on HF — ggml-format binaries maintained alongside whisper.cpp.
 const vad_repo = "ggml-org/whisper-vad";
 const vad_filename = "ggml-silero-v5.1.2.bin";
+
+fn parseBackend(s: ?[]const u8) ?asr.Backend {
+    if (s == null) return null;
+    if (std.mem.eql(u8, s.?, "qwen3")) return .qwen3;
+    if (std.mem.eql(u8, s.?, "whisper")) return .whisper;
+    return null;
+}
 
 /// Write to stdout. Use this for content the user is meant to capture / pipe
 /// (transcribed text, paths, versions). Diagnostics and errors go through
@@ -79,21 +92,77 @@ fn modelPath(
     io: std.Io,
     env: *std.process.Environ.Map,
 ) !u8 {
-    const m = try hf.predictPath(allocator, io, env, .{ .repo = repo, .filename = model_filename });
-    defer allocator.free(m);
-    const p = try hf.predictPath(allocator, io, env, .{ .repo = repo, .filename = mmproj_filename });
-    defer allocator.free(p);
-    try printStdout(io, "{s}\n{s}\n", .{ m, p });
+    // Show both backends so the user can see what's resolved either way.
+    const q_m = try hf.predictPath(allocator, io, env, .{ .repo = qwen3_repo, .filename = qwen3_model_filename });
+    defer allocator.free(q_m);
+    const q_p = try hf.predictPath(allocator, io, env, .{ .repo = qwen3_repo, .filename = qwen3_mmproj_filename });
+    defer allocator.free(q_p);
+    const w = try hf.predictPath(allocator, io, env, .{ .repo = whisper_repo, .filename = whisper_model_filename });
+    defer allocator.free(w);
+    try printStdout(io, "qwen3 model:   {s}\nqwen3 mmproj:  {s}\nwhisper model: {s}\n", .{ q_m, q_p, w });
     return 0;
 }
 
 fn modelPull(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) !u8 {
-    const m = try hf.ensureFile(allocator, io, env, .{ .repo = repo, .filename = model_filename });
-    defer allocator.free(m);
-    const p = try hf.ensureFile(allocator, io, env, .{ .repo = repo, .filename = mmproj_filename });
-    defer allocator.free(p);
-    try printStdout(io, "{s}\n{s}\n", .{ m, p });
+    // Pull both default backends. Cheaper to do at once if the user wants to
+    // pre-warm everything.
+    const q_m = try hf.ensureFile(allocator, io, env, .{ .repo = qwen3_repo, .filename = qwen3_model_filename });
+    defer allocator.free(q_m);
+    const q_p = try hf.ensureFile(allocator, io, env, .{ .repo = qwen3_repo, .filename = qwen3_mmproj_filename });
+    defer allocator.free(q_p);
+    const w = try hf.ensureFile(allocator, io, env, .{ .repo = whisper_repo, .filename = whisper_model_filename });
+    defer allocator.free(w);
+    try printStdout(io, "qwen3 model:   {s}\nqwen3 mmproj:  {s}\nwhisper model: {s}\n", .{ q_m, q_p, w });
     return 0;
+}
+
+const ResolvedPaths = struct {
+    backend: asr.Backend,
+    model: [:0]u8,
+    mmproj: ?[:0]u8, // null for whisper
+
+    fn deinit(self: ResolvedPaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.model);
+        if (self.mmproj) |p| allocator.free(p);
+    }
+};
+
+/// Resolves the model files for the chosen backend, downloading from HF on
+/// cache miss. `--model PATH` skips download for the main model file.
+fn resolvePaths(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    backend: asr.Backend,
+    override_model: ?[]const u8,
+) !ResolvedPaths {
+    switch (backend) {
+        .qwen3 => {
+            const model = if (override_model) |p|
+                try allocator.dupeZ(u8, p)
+            else blk: {
+                const p = try hf.ensureFile(allocator, io, env, .{ .repo = qwen3_repo, .filename = qwen3_model_filename });
+                defer allocator.free(p);
+                break :blk try allocator.dupeZ(u8, p);
+            };
+            const mmproj = blk: {
+                const p = try hf.ensureFile(allocator, io, env, .{ .repo = qwen3_repo, .filename = qwen3_mmproj_filename });
+                defer allocator.free(p);
+                break :blk try allocator.dupeZ(u8, p);
+            };
+            return .{ .backend = .qwen3, .model = model, .mmproj = mmproj };
+        },
+        .whisper => {
+            const model = if (override_model) |p|
+                try allocator.dupeZ(u8, p)
+            else blk: {
+                const p = try hf.ensureFile(allocator, io, env, .{ .repo = whisper_repo, .filename = whisper_model_filename });
+                defer allocator.free(p);
+                break :blk try allocator.dupeZ(u8, p);
+            };
+            return .{ .backend = .whisper, .model = model, .mmproj = null };
+        },
+    }
 }
 
 fn transcribe(
@@ -107,10 +176,18 @@ fn transcribe(
         return 1;
     }
 
-    // Server fallback: short-circuit before loading any local model state.
-    // Same Result shape, same output formatting → fully fungible with the
-    // in-process path from the user's perspective.
+    const backend = parseBackend(args.backend) orelse .qwen3;
+    if (args.backend != null and parseBackend(args.backend) == null) {
+        std.debug.print("error: unknown --backend '{s}' (qwen3|whisper)\n", .{args.backend.?});
+        return 1;
+    }
+
+    // Server fallback (qwen3 only — llama-server doesn't host whisper).
     if (args.server_url) |url| {
+        if (backend != .qwen3) {
+            std.debug.print("error: --server-url only works with --backend qwen3\n", .{});
+            return 1;
+        }
         if (args.verbose) std.debug.print("server:  {s}\n", .{url});
         const result = server.transcribe(allocator, io, url, args.audio_path) catch |err| {
             errors.print("error", err);
@@ -122,48 +199,35 @@ fn transcribe(
         return 0;
     }
 
-    // Quiet llama/mtmd unless --verbose.
     if (!args.verbose) {
         c.llama_log_set(quietLogCb, null);
         c.mtmd_helper_log_set(quietLogCb, null);
     }
 
-    // Resolve paths.
-    const model_path = if (args.model_path) |p|
-        try allocator.dupeZ(u8, p)
-    else blk: {
-        const p = try hf.ensureFile(allocator, io, env, .{ .repo = repo, .filename = model_filename });
-        defer allocator.free(p);
-        break :blk try allocator.dupeZ(u8, p);
-    };
-    defer allocator.free(model_path);
+    const paths = try resolvePaths(allocator, io, env, backend, args.model_path);
+    defer paths.deinit(allocator);
 
-    const mmproj_path = blk: {
-        // mmproj follows main model: live next to it, or be downloaded.
-        const p = try hf.ensureFile(allocator, io, env, .{ .repo = repo, .filename = mmproj_filename });
-        defer allocator.free(p);
-        break :blk try allocator.dupeZ(u8, p);
-    };
-    defer allocator.free(mmproj_path);
+    const language_z: ?[:0]const u8 = if (args.language) |l|
+        try allocator.dupeZ(u8, l)
+    else
+        null;
+    defer if (language_z) |l| allocator.free(l);
 
     const audio_z = try allocator.dupeZ(u8, args.audio_path);
     defer allocator.free(audio_z);
 
     if (args.verbose) {
-        std.debug.print("model:   {s}\n", .{model_path});
-        std.debug.print("mmproj:  {s}\n", .{mmproj_path});
+        std.debug.print("backend: {s}\n", .{@tagName(backend)});
+        std.debug.print("model:   {s}\n", .{paths.model});
+        if (paths.mmproj) |p| std.debug.print("mmproj:  {s}\n", .{p});
         std.debug.print("audio:   {s}\n", .{audio_z});
     }
 
-    // v0.2.0 spike: route through Session.transcribePCM (raw f32 PCM) to
-    // verify that our wav decoder + mtmd_bitmap_init_from_audio path produces
-    // the same output as mtmd_helper_bitmap_init_from_file. If it does, the
-    // listen subcommand can reuse this exact code path with mic samples.
-    // v0.2.0: route through Session + decoded PCM. Same path the listen
-    // subcommand will use with mic samples; one less code path to maintain.
     var session = asr.Session.open(allocator, .{
-        .model_path = model_path,
-        .mmproj_path = mmproj_path,
+        .backend = backend,
+        .model_path = paths.model,
+        .mmproj_path = paths.mmproj,
+        .language = language_z,
         .n_threads = args.threads orelse 4,
     }) catch |err| {
         errors.print("error", err);
@@ -171,29 +235,13 @@ fn transcribe(
     };
     defer session.close();
 
-    const decoded = asr.Wav.decodeFile(allocator, io, args.audio_path) catch |err| {
-        errors.print("error", err);
-        return 1;
-    };
-    defer decoded.deinit(allocator);
-    if (args.verbose) std.debug.print(
-        "wav: {d} samples @ {d} Hz ({d:.2}s)\n",
-        .{
-            decoded.samples.len,
-            decoded.sample_rate,
-            @as(f64, @floatFromInt(decoded.samples.len)) / @as(f64, @floatFromInt(decoded.sample_rate)),
-        },
-    );
-    const result = session.transcribePCM(decoded.samples) catch |err| {
+    const result = session.transcribeFile(audio_z) catch |err| {
         errors.print("error", err);
         return 3;
     };
     defer result.deinit(allocator);
 
-    if (args.verbose) {
-        std.debug.print("language: {s}\n", .{result.language});
-    }
-
+    if (args.verbose) std.debug.print("language: {s}\n", .{result.language});
     try writeText(io, args.output_path, result.text);
     return 0;
 }
@@ -214,31 +262,31 @@ fn listen(
     env: *std.process.Environ.Map,
     args: cli.ListenArgs,
 ) !u8 {
+    const backend = parseBackend(args.backend) orelse .qwen3;
+    if (args.backend != null and parseBackend(args.backend) == null) {
+        std.debug.print("error: unknown --backend '{s}' (qwen3|whisper)\n", .{args.backend.?});
+        return 1;
+    }
+
     if (!args.verbose) {
         c.llama_log_set(quietLogCb, null);
         c.mtmd_helper_log_set(quietLogCb, null);
     }
 
-    // Resolve model paths (same flow as transcribe).
-    const model_path = if (args.model_path) |p|
-        try allocator.dupeZ(u8, p)
-    else blk: {
-        const p = try hf.ensureFile(allocator, io, env, .{ .repo = repo, .filename = model_filename });
-        defer allocator.free(p);
-        break :blk try allocator.dupeZ(u8, p);
-    };
-    defer allocator.free(model_path);
+    const paths = try resolvePaths(allocator, io, env, backend, args.model_path);
+    defer paths.deinit(allocator);
 
-    const mmproj_path = blk: {
-        const p = try hf.ensureFile(allocator, io, env, .{ .repo = repo, .filename = mmproj_filename });
-        defer allocator.free(p);
-        break :blk try allocator.dupeZ(u8, p);
-    };
-    defer allocator.free(mmproj_path);
+    const language_z: ?[:0]const u8 = if (args.language) |l|
+        try allocator.dupeZ(u8, l)
+    else
+        null;
+    defer if (language_z) |l| allocator.free(l);
 
     var session = asr.Session.open(allocator, .{
-        .model_path = model_path,
-        .mmproj_path = mmproj_path,
+        .backend = backend,
+        .model_path = paths.model,
+        .mmproj_path = paths.mmproj,
+        .language = language_z,
         .n_threads = args.threads orelse 4,
     }) catch |err| {
         errors.print("error", err);
@@ -246,7 +294,7 @@ fn listen(
     };
     defer session.close();
 
-    const backend: vad.Backend = blk: {
+    const vad_backend: vad.Backend = blk: {
         if (args.vad) |s| {
             if (std.mem.eql(u8, s, "energy")) break :blk .energy;
             if (std.mem.eql(u8, s, "silero")) break :blk .silero;
@@ -259,7 +307,7 @@ fn listen(
     // Silero needs its model file; resolve and pass through.
     var silero_path_owned: ?[:0]u8 = null;
     defer if (silero_path_owned) |p| allocator.free(p);
-    const silero_model_path: ?[:0]const u8 = if (backend == .silero) blk: {
+    const silero_model_path: ?[:0]const u8 = if (vad_backend == .silero) blk: {
         const p = hf.ensureFile(allocator, io, env, .{
             .repo = vad_repo,
             .filename = vad_filename,
@@ -274,7 +322,7 @@ fn listen(
     } else null;
 
     var detector = vad.Detector.init(allocator, .{
-        .backend = backend,
+        .backend = vad_backend,
         .energy_threshold = args.threshold orelse 0.012,
         .silero_threshold = args.threshold orelse 0.5,
         .silero_model_path = silero_model_path,

@@ -1,0 +1,54 @@
+asrctl bench — dual-backend snapshot — 2026-05-02
+====================================================
+Hardware:  Apple M2 Pro, 32 GB
+Build:     ReleaseFast static binary, 6.2 MB
+Backends:  qwen3   = Qwen3-ASR-0.6B-Q8_0     (~1.5 GB on disk: model + mmproj)
+           whisper = ggml-large-v3-turbo-q5_0 (~547 MB)
+
+                          wall time
+                          ─────────
+EN short (5.4s audio)
+  qwen3    cold/warm      ~1.6 s / ~1.2 s
+  whisper  cold/warm      ~2.2 s / ~2.2 s
+
+EN long (17s audio)
+  qwen3    cold/warm      ~1.7 s
+  whisper  cold/warm      ~2.1 s
+
+ZH short (3.7s audio)
+  qwen3    cold/warm      ~1.2 s
+  whisper  cold/warm      ~2.2 s
+
+ZH long (17s audio)
+  qwen3    cold/warm      ~1.7 s
+  whisper  cold/warm      ~2.2 s
+
+Quality differences (sample EN long):
+  ground-truth: "...The Qwen 3 ASR model is a 0.6 billion parameter
+                  encoder-decoder architecture optimized for low latency
+                  on Apple Silicon."
+  qwen3:    "The Qwen-3 model is zero point six billion parameter
+             encoder decoder architecture optimized for latency"
+            ↑ dropped "ASR", spelled-out 0.6, "low latency" → "latency"
+  whisper:  "The QEN 3ASR model is a 0.6 billion parameter encoder-decoder
+             architecture optimized for low latency on Apple Silicon."
+            ↑ literal phonetic spelling of "Qwen 3 ASR"
+
+Quality differences (sample ZH long):
+  ground-truth: "...让我们坐在长椅上..."
+  qwen3:    "让我们坐在草椅上"   ← acoustic confusion 长 vs 草
+  whisper:  "让我们坐在长椅上"   ← LM context recovers
+
+Punctuation:
+  qwen3:    full-width comma "，"
+  whisper:  half-width comma ","
+
+Conclusion:
+  - qwen3 wins on raw speed (~30-50% faster) and Chinese punctuation style
+  - whisper wins on LM-side context (catches obscure words via stronger prior)
+  - both correctly transcribe basic samples; quality difference shows on
+    less-common words and ambiguous phonetics
+
+Reproduce:
+  zig build -Doptimize=ReleaseFast
+  bench/bench.sh

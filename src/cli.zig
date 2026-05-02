@@ -19,6 +19,8 @@ pub const Subcommand = union(enum) {
 pub const ListenArgs = struct {
     output_path: ?[]const u8 = null,
     model_path: ?[]const u8 = null,
+    backend: ?[]const u8 = null, // "qwen3" | "whisper"
+    language: ?[]const u8 = null,
     vad: ?[]const u8 = null, // "energy" | "silero"
     threads: ?i32 = null,
     threshold: ?f32 = null,
@@ -31,6 +33,8 @@ pub const TranscribeArgs = struct {
     output_path: ?[]const u8 = null,
     model_path: ?[]const u8 = null,
     server_url: ?[]const u8 = null,
+    backend: ?[]const u8 = null, // "qwen3" | "whisper"
+    language: ?[]const u8 = null,
     threads: ?i32 = null,
     verbose: bool = false,
 };
@@ -42,27 +46,37 @@ pub const ParseError = error{
 } || std.mem.Allocator.Error || std.fmt.ParseIntError;
 
 pub const usage_text =
-    \\asrctl — macOS Apple Silicon ASR CLI (Qwen3-ASR via llama.cpp + mtmd)
+    \\asrctl — macOS Apple Silicon ASR CLI
+    \\
+    \\Backends (--backend):
+    \\  qwen3    Qwen3-ASR-0.6B via llama.cpp + mtmd. Strong multilingual,
+    \\           best Chinese accuracy. ~1.5 GB model + mmproj. (default)
+    \\  whisper  whisper.cpp + ggml-large-v3-turbo (Q5_0). OpenAI SOTA.
+    \\           ~547 MB. Best for English / Latin languages.
     \\
     \\Usage:
     \\  asrctl <wav-file> [options]            transcribe a wav file
     \\  asrctl listen [options]                live mic → text (Ctrl-C to stop)
-    \\  asrctl model path                      print resolved model path
-    \\  asrctl model pull                      download model + mmproj from HF
+    \\  asrctl model path                      print resolved model paths
+    \\  asrctl model pull                      download default backend model
     \\  asrctl version                         print version
     \\  asrctl help                            show this help
     \\
     \\Transcribe options:
     \\  -o, --output PATH    write text to file instead of stdout
-    \\      --model PATH     override model gguf path
-    \\      --server-url URL forward to a running llama-server instead of
-    \\                       loading the model in-process (e.g. http://127.0.0.1:8080)
+    \\      --backend NAME   ASR backend: qwen3 (default) | whisper
+    \\      --model PATH     override model gguf/bin path
+    \\      --language CODE  hint language for whisper (en/zh/auto/...). Qwen3 auto-detects.
+    \\      --server-url URL forward to llama-server (qwen3 only) instead of
+    \\                       loading the model in-process
     \\      --threads N      CPU threads (default 4)
     \\  -v, --verbose        print timing/diagnostic info to stderr
     \\
     \\Listen options (asrctl listen):
     \\  -o, --output PATH    append each utterance to file instead of stdout
-    \\      --model PATH     override model gguf path
+    \\      --backend NAME   ASR backend: qwen3 (default) | whisper
+    \\      --model PATH     override model path
+    \\      --language CODE  hint language for whisper
     \\      --vad BACKEND    VAD backend: energy (default) | silero
     \\      --threshold F    VAD threshold (energy: RMS 0..1, silero: P 0..1)
     \\      --silence-ms N   silence duration that ends an utterance (default 600)
@@ -122,6 +136,14 @@ fn parseListen(rest: []const [*:0]const u8) ParseError!Subcommand {
             i += 1;
             if (i >= rest.len) return error.MissingValue;
             args.threads = try std.fmt.parseInt(i32, std.mem.span(rest[i]), 10);
+        } else if (std.mem.eql(u8, a, "--backend")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.backend = std.mem.span(rest[i]);
+        } else if (std.mem.eql(u8, a, "--language")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.language = std.mem.span(rest[i]);
         } else if (std.mem.eql(u8, a, "--vad")) {
             i += 1;
             if (i >= rest.len) return error.MissingValue;
@@ -162,6 +184,14 @@ fn parseTranscribe(rest: []const [*:0]const u8) ParseError!Subcommand {
             i += 1;
             if (i >= rest.len) return error.MissingValue;
             args.server_url = std.mem.span(rest[i]);
+        } else if (std.mem.eql(u8, a, "--backend")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.backend = std.mem.span(rest[i]);
+        } else if (std.mem.eql(u8, a, "--language")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.language = std.mem.span(rest[i]);
         } else if (std.mem.eql(u8, a, "--threads")) {
             i += 1;
             if (i >= rest.len) return error.MissingValue;
