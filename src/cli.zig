@@ -67,6 +67,8 @@ pub const usage_text =
     \\           best Chinese accuracy. ~1.5 GB model + mmproj. (default)
     \\  whisper  whisper.cpp + ggml-large-v3-turbo (Q5_0). OpenAI SOTA.
     \\           ~547 MB. Best for English / Latin languages.
+    \\  auto     Probe with tiny whisper, pick qwen3 for zh / whisper otherwise.
+    \\           Adds ~300-500 ms one-time latency. (transcribe only; not listen)
     \\
     \\Usage:
     \\  asrctl <wav-file> [options]            transcribe a wav file
@@ -78,7 +80,7 @@ pub const usage_text =
     \\
     \\Transcribe options:
     \\  -o, --output PATH    write text to file instead of stdout
-    \\      --backend NAME   ASR backend: qwen3 (default) | whisper
+    \\      --backend NAME   ASR backend: qwen3 (default) | whisper | auto
     \\      --model PATH     override model gguf/bin path
     \\      --whisper-model NAME  whisper size: tiny|base|small|medium|large-v3-turbo
     \\      --language CODE  hint language for whisper (en/zh/auto/...). Qwen3 auto-detects.
@@ -91,7 +93,7 @@ pub const usage_text =
     \\
     \\Listen options (asrctl listen):
     \\  -o, --output PATH    append each utterance to file instead of stdout
-    \\      --backend NAME   ASR backend: qwen3 (default) | whisper
+    \\      --backend NAME   ASR backend: qwen3 (default) | whisper | auto
     \\      --model PATH     override model path
     \\      --whisper-model NAME           whisper main size (default large-v3-turbo)
     \\      --whisper-partial-model NAME   smaller model for partials (default tiny

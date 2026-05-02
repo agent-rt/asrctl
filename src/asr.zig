@@ -407,6 +407,52 @@ pub const WhisperSession = struct {
     }
 };
 
+// ---------- language detection (auto backend) ----------
+
+/// Quick language probe via whisper. Loads `model_path` (small/tiny preferred)
+/// just long enough to identify the language, returns the ISO code ("zh",
+/// "en", ...). Caller owns the returned slice.
+///
+/// Used by `--backend auto` to route to the right ASR backend before doing
+/// the actual transcription.
+pub fn detectLanguage(
+    allocator: std.mem.Allocator,
+    model_path: [:0]const u8,
+    samples: []const f32,
+) Error![]u8 {
+    var session = try WhisperSession.open(allocator, .{
+        .backend = .whisper,
+        .model_path = model_path,
+        .n_threads = 4,
+        .language = null, // "auto"
+    });
+    defer session.close();
+
+    // First ~5 s is enough for confident language identification.
+    const probe_n = @min(samples.len, 5 * 16_000);
+    const probe = samples[0..probe_n];
+
+    var fparams = c.whisper_full_default_params(c.WHISPER_SAMPLING_GREEDY);
+    fparams.print_progress = false;
+    fparams.print_special = false;
+    fparams.print_realtime = false;
+    fparams.print_timestamps = false;
+    fparams.no_timestamps = true;
+    fparams.n_threads = 4;
+    fparams.language = "auto";
+    // We don't need the text, just the language id. `single_segment` keeps
+    // the decoder cheap; small audio_ctx makes the encoder ~3-4× faster.
+    fparams.single_segment = true;
+    fparams.audio_ctx = 768;
+
+    if (c.whisper_full(session.ctx, fparams, probe.ptr, @intCast(probe.len)) != 0)
+        return error.WhisperFullFailed;
+
+    const lang_id = c.whisper_full_lang_id(session.ctx);
+    const lang_str = c.whisper_lang_str(lang_id);
+    return allocator.dupe(u8, std.mem.span(lang_str));
+}
+
 // ---------- one-shot helper ----------
 
 pub fn transcribe(

@@ -68,11 +68,29 @@ const whisper_default_partial: WhisperModelSize = .tiny;
 const vad_repo = "ggml-org/whisper-vad";
 const vad_filename = "ggml-silero-v5.1.2.bin";
 
-fn parseBackend(s: ?[]const u8) ?asr.Backend {
+/// Tri-state result of parsing the `--backend` flag. `auto` is its own value
+/// — it triggers a language probe and then picks one of the real backends.
+const BackendChoice = union(enum) {
+    real: asr.Backend,
+    auto,
+};
+
+fn parseBackend(s: ?[]const u8) ?BackendChoice {
     if (s == null) return null;
-    if (std.mem.eql(u8, s.?, "qwen3")) return .qwen3;
-    if (std.mem.eql(u8, s.?, "whisper")) return .whisper;
+    if (std.mem.eql(u8, s.?, "qwen3")) return .{ .real = .qwen3 };
+    if (std.mem.eql(u8, s.?, "whisper")) return .{ .real = .whisper };
+    if (std.mem.eql(u8, s.?, "auto")) return .auto;
     return null;
+}
+
+/// Heuristic: which backend handles a given language best?
+///   - zh / yue / wuu (Chinese family): qwen3 (Alibaba 2026 SOTA on Chinese)
+///   - everything else: whisper-large-v3-turbo (OpenAI multilingual SOTA)
+fn backendForLanguage(lang: []const u8) asr.Backend {
+    if (std.mem.eql(u8, lang, "zh") or
+        std.mem.eql(u8, lang, "yue") or
+        std.mem.eql(u8, lang, "wuu")) return .qwen3;
+    return .whisper;
 }
 
 /// Write to stdout. Use this for content the user is meant to capture / pipe
@@ -232,11 +250,54 @@ fn transcribe(
         return 1;
     }
 
-    const backend = parseBackend(args.backend) orelse .qwen3;
-    if (args.backend != null and parseBackend(args.backend) == null) {
-        std.debug.print("error: unknown --backend '{s}' (qwen3|whisper)\n", .{args.backend.?});
-        return 1;
-    }
+    const choice: BackendChoice = blk: {
+        if (args.backend) |s| {
+            if (parseBackend(s)) |bc| break :blk bc;
+            std.debug.print("error: unknown --backend '{s}' (qwen3|whisper|auto)\n", .{s});
+            return 1;
+        }
+        break :blk .{ .real = .qwen3 };
+    };
+
+    // Auto: probe the audio with tiny whisper to identify the language, then
+    // route to the real backend. Adds ~300-500 ms one-time latency.
+    var auto_decoded: ?asr.Wav.Decoded = null;
+    defer if (auto_decoded) |d| d.deinit(allocator);
+    const backend: asr.Backend = switch (choice) {
+        .real => |b| b,
+        .auto => blk: {
+            if (args.server_url != null) {
+                std.debug.print("error: --server-url is incompatible with --backend auto\n", .{});
+                return 1;
+            }
+            if (!args.verbose) {
+                c.llama_log_set(quietLogCb, null);
+                c.mtmd_helper_log_set(quietLogCb, null);
+            }
+            const tiny_path = try resolveWhisperSizePath(allocator, io, env, .tiny);
+            defer allocator.free(tiny_path);
+
+            // Decode wav once; stash for the real transcribe below to reuse.
+            const decoded = asr.Wav.decodeFile(allocator, io, args.audio_path) catch |err| {
+                errors.print("error", err);
+                return 1;
+            };
+            auto_decoded = decoded;
+
+            const lang = asr.detectLanguage(allocator, tiny_path, decoded.samples) catch |err| {
+                errors.print("error", err);
+                return 3;
+            };
+            defer allocator.free(lang);
+
+            const picked = backendForLanguage(lang);
+            if (args.verbose) std.debug.print(
+                "auto: detected language='{s}' → backend={s}\n",
+                .{ lang, @tagName(picked) },
+            );
+            break :blk picked;
+        },
+    };
 
     // Server fallback (qwen3 only — llama-server doesn't host whisper).
     if (args.server_url) |url| {
@@ -300,9 +361,15 @@ fn transcribe(
     };
     defer session.close();
 
-    // For --quick, decode wav ourselves and route through the audio_ctx-scaled
-    // PCM path. Otherwise use the file helper which goes through full ctx.
+    // If --backend auto already decoded the wav for the language probe, reuse
+    // those samples instead of re-reading the file. Same for --quick path.
     const result = blk: {
+        if (auto_decoded) |d| {
+            break :blk session.transcribePCM(d.samples) catch |err| {
+                errors.print("error", err);
+                return 3;
+            };
+        }
         if (args.quick) {
             if (backend != .whisper) {
                 std.debug.print("note: --quick is whisper-specific; ignored for qwen3\n", .{});
@@ -346,11 +413,23 @@ fn listen(
     env: *std.process.Environ.Map,
     args: cli.ListenArgs,
 ) !u8 {
-    const backend = parseBackend(args.backend) orelse .qwen3;
-    if (args.backend != null and parseBackend(args.backend) == null) {
-        std.debug.print("error: unknown --backend '{s}' (qwen3|whisper)\n", .{args.backend.?});
-        return 1;
-    }
+    const choice: BackendChoice = blk: {
+        if (args.backend) |s| {
+            if (parseBackend(s)) |c2| break :blk c2;
+            std.debug.print("error: unknown --backend '{s}' (qwen3|whisper|auto)\n", .{s});
+            return 1;
+        }
+        break :blk .{ .real = .qwen3 };
+    };
+    const backend: asr.Backend = switch (choice) {
+        .real => |b| b,
+        .auto => {
+            std.debug.print("error: --backend auto is not yet supported in listen mode\n" ++
+                "       (per-utterance language probe would add 50-100 ms latency).\n" ++
+                "       Workaround: pick qwen3 for Chinese-heavy use, whisper otherwise.\n", .{});
+            return 1;
+        },
+    };
 
     if (!args.verbose) {
         c.llama_log_set(quietLogCb, null);

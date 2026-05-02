@@ -13,6 +13,7 @@ silero VAD, llama-server fallback. No Python.
 
 ```sh
 asrctl audio.wav                          # → stdout, default qwen3 backend
+asrctl --backend auto audio.wav           # ★ auto-pick by language (zh→qwen3, else→whisper)
 asrctl --backend whisper audio.wav        # use whisper-large-v3-turbo
 asrctl audio.wav -o out.txt               # → file
 asrctl --server-url http://127.0.0.1:8080 audio.wav   # qwen3 via llama-server
@@ -33,6 +34,8 @@ EN: 5 s wav → ~1.2 s wall time. ZH: same. See [`bench/`](bench/).
 - ✅ v0.6: whisper `audio_ctx` scaling — partial inference -23% wall time.
 - ✅ v0.7: whisper model picker + dual-model partial preview
   (`--whisper-model`, auto-loads tiny for partials → ~63 ms vs ~1 s).
+- ✅ v0.8: `--backend auto` — tiny whisper probes language, routes Chinese to
+  Qwen3 / others to whisper. Zero-config, optimal-quality default.
 - See [`docs/REQ.md`](docs/REQ.md) for the full requirements & milestones.
 
 ## Backend comparison
