@@ -57,6 +57,42 @@ pub fn build(b: *std.Build) void {
     cmake_build.addDirectoryArg(llama_root);
     const cmake_out = cmake_build.addOutputDirectoryArg("upstream-build");
 
+    // whisper.cpp lives in `_vendor/whisper.cpp` (gitignored). It contains
+    // the silero VAD implementation that v0.3 uses for `asrctl listen`.
+    // We only link `libwhisper.a` and reuse llama.cpp's ggml; both projects
+    // pin ggml at the same major.minor version (0.10.x).
+    const whisper_root = b.path("_vendor/whisper.cpp");
+    const whisper_build = b.addSystemCommand(&.{
+        "bash", "-eu", "-c",
+        \\set -eu
+        \\SRC="$1"; OUT="$2"
+        \\mkdir -p "$OUT"
+        \\if [ ! -f "$OUT/.configured" ]; then
+        \\  cmake "$SRC" -B "$OUT" \
+        \\    -DCMAKE_BUILD_TYPE=Release \
+        \\    -DBUILD_SHARED_LIBS=OFF \
+        \\    -DGGML_BACKEND_DL=OFF \
+        \\    -DGGML_NATIVE=OFF \
+        \\    -DGGML_METAL=ON \
+        \\    -DGGML_METAL_EMBED_LIBRARY=ON \
+        \\    -DGGML_BLAS=ON \
+        \\    -DGGML_OPENMP=OFF \
+        \\    -DGGML_CCACHE=OFF \
+        \\    -DCMAKE_C_COMPILER_LAUNCHER= \
+        \\    -DCMAKE_CXX_COMPILER_LAUNCHER= \
+        \\    -DWHISPER_BUILD_TESTS=OFF \
+        \\    -DWHISPER_BUILD_EXAMPLES=OFF \
+        \\    -DWHISPER_BUILD_SERVER=OFF >/dev/null
+        \\  touch "$OUT/.configured"
+        \\fi
+        \\cmake --build "$OUT" --target whisper -- -j$(sysctl -n hw.ncpu) >/dev/null
+        \\test -f "$OUT/src/libwhisper.a" || { echo "missing libwhisper.a" >&2; exit 1; }
+        ,
+        "--",
+    });
+    whisper_build.addDirectoryArg(whisper_root);
+    const whisper_out = whisper_build.addOutputDirectoryArg("whisper-build");
+
     // Module setup.
     const c_translate = b.addTranslateC(.{
         .root_source_file = b.path("src/c.h"),
@@ -66,6 +102,7 @@ pub fn build(b: *std.Build) void {
     c_translate.addIncludePath(llama_root.path(b, "include"));
     c_translate.addIncludePath(llama_root.path(b, "ggml/include"));
     c_translate.addIncludePath(llama_root.path(b, "tools/mtmd"));
+    c_translate.addIncludePath(whisper_root.path(b, "include"));
     const c_mod = c_translate.createModule();
 
     const exe_mod = b.createModule(.{
@@ -85,6 +122,7 @@ pub fn build(b: *std.Build) void {
     // libs which contribute their `register_backend` constructors.
     exe_mod.addObjectFile(cmake_out.path(b, "tools/mtmd/libmtmd.a"));
     exe_mod.addObjectFile(cmake_out.path(b, "src/libllama.a"));
+    exe_mod.addObjectFile(whisper_out.path(b, "src/libwhisper.a"));
     exe_mod.addObjectFile(cmake_out.path(b, "ggml/src/libggml.a"));
     exe_mod.addObjectFile(cmake_out.path(b, "ggml/src/ggml-blas/libggml-blas.a"));
     exe_mod.addObjectFile(cmake_out.path(b, "ggml/src/ggml-metal/libggml-metal.a"));

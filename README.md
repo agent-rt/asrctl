@@ -18,6 +18,7 @@ EN: 5 s wav → ~1.2 s wall time. ZH: same. See [`bench/`](bench/).
 
 - ✅ v0.1: wav transcription, in-process + llama-server fallback.
 - ✅ v0.2: real-time microphone streaming via `asrctl listen`.
+- ✅ v0.3: silero neural VAD via vendored whisper.cpp (`--vad silero`).
 - See [`docs/REQ.md`](docs/REQ.md) for the full requirements & milestones.
 
 ## Limitations
@@ -60,8 +61,12 @@ builds reuse the cmake cache.
 ### Build
 
 ```sh
-git clone <this repo>
+git clone https://github.com/agent-rt/asrctl
 cd asrctl
+# v0.3 silero VAD requires whisper.cpp source vendored locally.
+# (build.zig.zon would zig-fetch it, but whisper-vad's API surface is in the
+#  monolithic whisper.cpp file, so we cmake-build the whole project.)
+git clone --depth=1 https://github.com/ggml-org/whisper.cpp _vendor/whisper.cpp
 zig build -Doptimize=ReleaseFast
 ./zig-out/bin/asrctl --help
 ```
@@ -106,10 +111,17 @@ Exit codes: `0` ok / `1` user error / `2` internal / `3` inference / `4` server.
 
 ```sh
 asrctl listen                     # speak; Ctrl-C to stop
+asrctl listen --vad silero        # neural VAD, better noise robustness
 asrctl listen -v                  # see VAD + per-utterance timing on stderr
 asrctl listen -o transcript.log   # append each utterance as a new line
-asrctl listen --threshold 0.02 --silence-ms 500   # tune VAD for your env
+asrctl listen --threshold 0.5 --silence-ms 500   # tune VAD for your env
 ```
+
+VAD backends:
+- **`energy`** (default): RMS threshold. Fast, zero deps. Quiet rooms only.
+- **`silero`**: neural VAD via vendored whisper.cpp. Robust to fans / ambient
+  noise. Auto-downloads the 885 KB silero-v5 model on first use. CPU-only;
+  ~1 ms per 32 ms frame in ReleaseFast (negligible overhead).
 
 Pipeline: 16 kHz mono PCM from CoreAudio's AudioQueue → energy-based VAD
 (RMS threshold + silence-duration cut) → for each detected utterance, the

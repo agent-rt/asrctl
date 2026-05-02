@@ -17,6 +17,10 @@ jobs:
           cmake --version
           xcrun --find clang++
 
+      - name: Vendor whisper.cpp (silero VAD source)
+        run: |
+          git clone --depth=1 https://github.com/ggml-org/whisper.cpp _vendor/whisper.cpp
+
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0

@@ -6,3 +6,4 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "ggml-backend.h"
+#include "whisper.h"

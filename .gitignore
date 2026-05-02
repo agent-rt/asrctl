@@ -1,5 +1,6 @@
-zig-out/
-.zig-cache/
-zig-pkg/
+_vendor/
 .DS_Store
+.zig-cache/
 cortex.toml
+zig-out/
+zig-pkg/

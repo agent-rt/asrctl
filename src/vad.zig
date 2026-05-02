@@ -12,6 +12,7 @@
 //!                 once we vendor the upstream whisper-vad source.)
 
 const std = @import("std");
+const c = @import("c");
 
 pub const Backend = enum { energy, silero };
 
@@ -103,13 +104,14 @@ fn rms(frame: []const f32) f32 {
 // ---------- Silero backend (scaffolding) ----------
 
 /// Wraps a vendored whisper.cpp `whisper_vad_*` context. Frame size is fixed
-/// at silero v5's expected window (512 samples = 32 ms at 16 kHz).
+/// at silero v5's expected window (512 samples = 32 ms at 16 kHz). Per-frame
+/// inference uses `whisper_vad_detect_speech_no_reset` so LSTM state carries
+/// over (correct streaming semantics; reset between utterances is
+/// instantaneous and not currently needed).
 pub const SileroVoicer = struct {
     frame_samples: usize,
     threshold: f32,
-    /// Opaque handle to the loaded VAD context. v0.3.0: nil until v0.3.1
-    /// wires up the actual whisper-vad C API.
-    ctx: ?*anyopaque,
+    ctx: *c.whisper_vad_context,
     allocator: std.mem.Allocator,
 
     pub fn open(
@@ -117,28 +119,40 @@ pub const SileroVoicer = struct {
         model_path: [:0]const u8,
         threshold: f32,
     ) Error!SileroVoicer {
-        _ = model_path;
-        // v0.3.0: not yet wired. The infrastructure (CLI flag, model fetch,
-        // backend dispatch) is in place so v0.3.1 only needs to fill in the
-        // ggml inference call.
+        var params = c.whisper_vad_default_context_params();
+        // VAD is tiny; CPU is plenty and avoids Metal contention with the
+        // main ASR context that's also using the GPU.
+        params.use_gpu = false;
+        params.n_threads = 1;
+        const ctx = c.whisper_vad_init_from_file_with_params(model_path.ptr, params) orelse
+            return error.SileroLoadFailed;
         return .{
             .frame_samples = 512,
             .threshold = threshold,
-            .ctx = null,
+            .ctx = ctx,
             .allocator = allocator,
         };
     }
 
     pub fn isVoiced(self: *SileroVoicer, frame: []const f32) bool {
-        _ = self;
-        _ = frame;
-        // Returning true here would make every frame voiced → infinite
-        // segment. Return false → no segments. Neither is right; bail out.
-        @panic("silero VAD not yet implemented (v0.3.1)");
+        if (!c.whisper_vad_detect_speech_no_reset(self.ctx, frame.ptr, @intCast(frame.len)))
+            return false;
+        const n = c.whisper_vad_n_probs(self.ctx);
+        if (n <= 0) return false;
+        const probs = c.whisper_vad_probs(self.ctx);
+        // For a 512-sample frame, n_probs is 1. If we ever feed larger
+        // chunks (e.g. catch-up after lag), max across the window.
+        var max_p: f32 = 0;
+        var i: c_int = 0;
+        while (i < n) : (i += 1) {
+            const p = probs[@intCast(i)];
+            if (p > max_p) max_p = p;
+        }
+        return max_p >= self.threshold;
     }
 
     pub fn deinit(self: *SileroVoicer) void {
-        _ = self;
+        c.whisper_vad_free(self.ctx);
     }
 };
 
