@@ -1,4 +1,3 @@
-_vendor/
 .DS_Store
 .zig-cache/
 cortex.toml

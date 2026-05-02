@@ -11,8 +11,9 @@
 //!      `<root>/asrctl/{org}--{repo}/{filename}`. This is what we write to;
 //!      we don't try to recreate the symlink+blob structure used by
 //!      huggingface_hub.
-//!   4. Downloads are done by spawning `curl -L --fail`. M5 may replace this
-//!      with std.http.
+//!   4. Downloads use `std.http.Client.fetch` (HTTPS to public domains works
+//!      fine on macOS — Bug 1 in docs/v0.10-std-http.md only bites
+//!      IP literals / `localhost`, not domain names).
 
 const std = @import("std");
 const Io = std.Io;
@@ -167,16 +168,26 @@ fn download(
     // Status to stderr.
     std.debug.print("downloading {s}\n   → {s}\n", .{ url, dest });
 
-    var child = std.process.spawn(io, .{
-        .argv = &.{
-            "curl", "-L", "--fail", "--progress-bar", "-o", dest, url,
-        },
-        .stdout = .inherit,
-        .stderr = .inherit,
-    }) catch return error.DownloadFailed;
-    const term = child.wait(io) catch return error.DownloadFailed;
-    switch (term) {
-        .exited => |code| if (code != 0) return error.DownloadFailed,
-        else => return error.DownloadFailed,
+    const file = cwd.createFile(io, dest, .{}) catch return error.DownloadFailed;
+    defer file.close(io);
+
+    var write_buf: [64 * 1024]u8 = undefined;
+    var fw = file.writer(io, &write_buf);
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &fw.interface,
+    }) catch |e| {
+        std.debug.print("  http error: {s}\n", .{@errorName(e)});
+        return error.DownloadFailed;
+    };
+    fw.flush() catch return error.DownloadFailed;
+
+    if (@intFromEnum(result.status) >= 400) {
+        std.debug.print("  http status: {d}\n", .{@intFromEnum(result.status)});
+        return error.DownloadFailed;
     }
 }

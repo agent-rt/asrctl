@@ -8,6 +8,10 @@
             .url = "git+https://github.com/ggml-org/llama.cpp?ref=b8990#660b1b4bdc6fedc18e8c3d87a945ffb51f91c547",
             .hash = "N-V-__8AAJNA6gh3FGTZ0lTleWAvHocOK6TCXG8dUhrxBDHX",
         },
+        .whisper_cpp = .{
+            .url = "git+https://github.com/ggml-org/whisper.cpp#4bf733672b2871d4153158af4f621a6dd9104f4a",
+            .hash = "N-V-__8AAKfQ_gF7dRSP3blxnBRjtE_FZhnvgEfEyDsZbGao",
+        },
     },
     .paths = .{
         "build.zig",

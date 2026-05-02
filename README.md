@@ -83,7 +83,7 @@ zig build -Doptimize=ReleaseFast
 - **Zig** 0.16.0 (new `std.Io` API).
 - **CMake** to compile the vendored llama.cpp into static libraries.
 - **macOS Apple Silicon** (M1/M2/M3/M4) with Xcode Command Line Tools.
-- `curl` for HuggingFace download (ships with macOS).
+- (No runtime dependency on `curl` — downloads use Zig's std.http.)
 
 The first `zig build` takes ~5 minutes to compile llama.cpp + ggml. Subsequent
 builds reuse the cmake cache.
@@ -93,10 +93,6 @@ builds reuse the cmake cache.
 ```sh
 git clone https://github.com/agent-rt/asrctl
 cd asrctl
-# v0.3 silero VAD requires whisper.cpp source vendored locally.
-# (build.zig.zon would zig-fetch it, but whisper-vad's API surface is in the
-#  monolithic whisper.cpp file, so we cmake-build the whole project.)
-git clone --depth=1 https://github.com/ggml-org/whisper.cpp _vendor/whisper.cpp
 zig build -Doptimize=ReleaseFast
 ./zig-out/bin/asrctl --help
 ```
@@ -205,7 +201,7 @@ Single Zig binary, ~5 modules under [`src/`](src/):
 
 - `main.zig` — entry, subcommand dispatch, stdout/stderr routing
 - `cli.zig` — argument parser
-- `hf.zig` — HuggingFace cache resolver + `curl` downloader
+- `hf.zig` — HuggingFace cache resolver + std.http downloader
 - `asr.zig` — in-process pipeline: load → mtmd → eval → sample → parse
 - `server.zig` — HTTP fallback via `llama-server` `/v1/audio/transcriptions`
 - `errors.zig` — wrap internal errors into human-readable diagnostics

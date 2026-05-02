@@ -20,6 +20,9 @@ pub fn build(b: *std.Build) void {
     const llama_dep = b.dependency("llama_cpp", .{});
     const llama_root = llama_dep.path("");
 
+    const whisper_dep = b.dependency("whisper_cpp", .{});
+    const whisper_root = whisper_dep.path("");
+
     // Run upstream's cmake build to produce static .a files. Outputs land in
     // a private build dir under the zig cache so incremental rebuilds work.
     const cmake_build = b.addSystemCommand(&.{
@@ -57,11 +60,10 @@ pub fn build(b: *std.Build) void {
     cmake_build.addDirectoryArg(llama_root);
     const cmake_out = cmake_build.addOutputDirectoryArg("upstream-build");
 
-    // whisper.cpp lives in `_vendor/whisper.cpp` (gitignored). It contains
-    // the silero VAD implementation that v0.3 uses for `asrctl listen`.
-    // We only link `libwhisper.a` and reuse llama.cpp's ggml; both projects
-    // pin ggml at the same major.minor version (0.10.x).
-    const whisper_root = b.path("_vendor/whisper.cpp");
+    // whisper.cpp is fetched via build.zig.zon (same pattern as llama.cpp).
+    // Used for the silero VAD implementation in `asrctl listen`. We only link
+    // `libwhisper.a` and reuse llama.cpp's ggml; both projects pin ggml at the
+    // same major.minor version (0.10.x).
     const whisper_build = b.addSystemCommand(&.{
         "bash", "-eu", "-c",
         \\set -eu

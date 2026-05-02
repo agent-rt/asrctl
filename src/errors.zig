@@ -48,9 +48,9 @@ pub fn friendly(err: anyerror) Diagnostic {
         },
 
         // server.zig
-        error.SpawnFailed => .{
-            .summary = "could not spawn curl",
-            .hint = "is curl installed? (it ships with macOS by default)",
+        error.InvalidServerUrl => .{
+            .summary = "--server-url must be http://<ip-or-localhost>[:port][/path]",
+            .hint = "https:// not supported here; use an IP literal or 'localhost' (macOS std.http DNS bug, see docs/v0.10-std-http.md)",
         },
         error.HttpFailed => .{
             .summary = "transcription request to llama-server failed",
