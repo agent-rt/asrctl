@@ -36,6 +36,8 @@ EN: 5 s wav → ~1.2 s wall time. ZH: same. See [`bench/`](bench/).
   (`--whisper-model`, auto-loads tiny for partials → ~63 ms vs ~1 s).
 - ✅ v0.8: `--backend auto` — tiny whisper probes language, routes Chinese to
   Qwen3 / others to whisper. Zero-config, optimal-quality default.
+- ✅ v0.9: `listen --backend auto` — first-utterance probe, then sticks for
+  the session. Zero-config live mic, too.
 - See [`docs/REQ.md`](docs/REQ.md) for the full requirements & milestones.
 
 ## Backend comparison
@@ -139,7 +141,8 @@ Exit codes: `0` ok / `1` user error / `2` internal / `3` inference / `4` server.
 
 ```sh
 asrctl listen                                     # qwen3 + energy VAD
-asrctl listen --vad silero                        # neural VAD
+asrctl listen --backend auto --vad silero         # ★ zero-config: probe → pick → stick
+asrctl listen --vad silero                        # neural VAD only
 asrctl listen --backend whisper --partial         # whisper + LIVE PARTIAL words
 asrctl listen --backend whisper --partial --vad silero   # full SOTA stack
 asrctl listen -o transcript.log                   # append each utterance as a line

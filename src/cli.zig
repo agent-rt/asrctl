@@ -68,7 +68,8 @@ pub const usage_text =
     \\  whisper  whisper.cpp + ggml-large-v3-turbo (Q5_0). OpenAI SOTA.
     \\           ~547 MB. Best for English / Latin languages.
     \\  auto     Probe with tiny whisper, pick qwen3 for zh / whisper otherwise.
-    \\           Adds ~300-500 ms one-time latency. (transcribe only; not listen)
+    \\           transcribe: probes first 5 s. listen: probes first utterance,
+    \\           then sticks for the session. Not compatible with --partial.
     \\
     \\Usage:
     \\  asrctl <wav-file> [options]            transcribe a wav file

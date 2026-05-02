@@ -421,15 +421,19 @@ fn listen(
         }
         break :blk .{ .real = .qwen3 };
     };
-    const backend: asr.Backend = switch (choice) {
-        .real => |b| b,
-        .auto => {
-            std.debug.print("error: --backend auto is not yet supported in listen mode\n" ++
-                "       (per-utterance language probe would add 50-100 ms latency).\n" ++
-                "       Workaround: pick qwen3 for Chinese-heavy use, whisper otherwise.\n", .{});
-            return 1;
-        },
-    };
+
+    // --backend auto is supported in listen mode via a "first-utterance probe"
+    // strategy: run VAD + capture without a loaded ASR model, wait for the
+    // first segment, run tiny whisper on it to detect language, then pick the
+    // real backend and open it. Subsequent utterances stick with that backend.
+    // Combining auto with --partial is rejected: the partial preview path
+    // needs the Session open at startup, and there's no clean "delay partials"
+    // semantics until the probe completes.
+    if (choice == .auto and args.partial) {
+        std.debug.print("error: --backend auto is not compatible with --partial\n" ++
+            "       Pick a backend explicitly (qwen3 or whisper) when using --partial.\n", .{});
+        return 1;
+    }
 
     if (!args.verbose) {
         c.llama_log_set(quietLogCb, null);
@@ -445,56 +449,11 @@ fn listen(
         break :blk whisper_default_main;
     };
 
-    // Smart default: when --partial is on with a medium+ main, transparently
-    // load `tiny` alongside it so partial preview is ~10× faster. User can
-    // override with --whisper-partial-model NAME or disable by passing
-    // --whisper-partial-model <same-as-main>.
-    const partial_size: ?WhisperModelSize = blk: {
-        if (backend != .whisper or !args.partial) break :blk null;
-        if (args.whisper_partial_model) |s| {
-            if (WhisperModelSize.parse(s)) |sz| {
-                if (sz == whisper_size) break :blk null; // no separate model needed
-                break :blk sz;
-            }
-            std.debug.print("error: unknown --whisper-partial-model '{s}'\n", .{s});
-            return 1;
-        }
-        if (whisper_size.isLargeForPartial()) break :blk whisper_default_partial;
-        break :blk null;
-    };
-
-    const paths = try resolvePaths(allocator, io, env, backend, args.model_path, whisper_size);
-    defer paths.deinit(allocator);
-
-    const partial_path: ?[:0]u8 = if (partial_size) |sz|
-        try resolveWhisperSizePath(allocator, io, env, sz)
-    else
-        null;
-    defer if (partial_path) |p| allocator.free(p);
-
-    if (args.verbose) {
-        std.debug.print("whisper main:    {s}\n", .{paths.model});
-        if (partial_path) |p| std.debug.print("whisper partial: {s}\n", .{p});
-    }
-
     const language_z: ?[:0]const u8 = if (args.language) |l|
         try allocator.dupeZ(u8, l)
     else
         null;
     defer if (language_z) |l| allocator.free(l);
-
-    var session = asr.Session.open(allocator, .{
-        .backend = backend,
-        .model_path = paths.model,
-        .mmproj_path = paths.mmproj,
-        .whisper_partial_model_path = partial_path,
-        .language = language_z,
-        .n_threads = args.threads orelse 4,
-    }) catch |err| {
-        errors.print("error", err);
-        return 3;
-    };
-    defer session.close();
 
     const vad_backend: vad.Backend = blk: {
         if (args.vad) |s| {
@@ -556,6 +515,88 @@ fn listen(
         };
         std.posix.sigaction(std.posix.SIG.INT, &dfl, null);
     }
+
+    // For --backend auto, run a "probe loop": pull audio + drive VAD without
+    // any ASR model loaded, wait for the first segment, then run tiny whisper
+    // on it to identify the language. Pick the real backend, open the
+    // Session, and feed that first segment into the normal onSegment flow.
+    var first_segment_owned: ?[]f32 = null;
+    defer if (first_segment_owned) |buf| allocator.free(buf);
+
+    const backend: asr.Backend = switch (choice) {
+        .real => |b| b,
+        .auto => blk: {
+            if (args.verbose) std.debug.print("auto: probing first utterance…\n", .{});
+            const probe_samples = probeFirstUtterance(allocator, io, &detector, capture) catch |err| {
+                errors.print("error", err);
+                return 3;
+            } orelse {
+                // Ctrl-C during probe.
+                return 0;
+            };
+            first_segment_owned = probe_samples;
+
+            const tiny_path = try resolveWhisperSizePath(allocator, io, env, .tiny);
+            defer allocator.free(tiny_path);
+
+            const lang = asr.detectLanguage(allocator, tiny_path, probe_samples) catch |err| {
+                errors.print("error", err);
+                return 3;
+            };
+            defer allocator.free(lang);
+
+            const picked = backendForLanguage(lang);
+            if (args.verbose) std.debug.print(
+                "auto: detected language='{s}' → backend={s} (sticking for session)\n",
+                .{ lang, @tagName(picked) },
+            );
+            break :blk picked;
+        },
+    };
+
+    // Smart default: when --partial is on with a medium+ main, transparently
+    // load `tiny` alongside it so partial preview is ~10× faster.
+    const partial_size: ?WhisperModelSize = blk: {
+        if (backend != .whisper or !args.partial) break :blk null;
+        if (args.whisper_partial_model) |s| {
+            if (WhisperModelSize.parse(s)) |sz| {
+                if (sz == whisper_size) break :blk null;
+                break :blk sz;
+            }
+            std.debug.print("error: unknown --whisper-partial-model '{s}'\n", .{s});
+            return 1;
+        }
+        if (whisper_size.isLargeForPartial()) break :blk whisper_default_partial;
+        break :blk null;
+    };
+
+    const paths = try resolvePaths(allocator, io, env, backend, args.model_path, whisper_size);
+    defer paths.deinit(allocator);
+
+    const partial_path: ?[:0]u8 = if (partial_size) |sz|
+        try resolveWhisperSizePath(allocator, io, env, sz)
+    else
+        null;
+    defer if (partial_path) |p| allocator.free(p);
+
+    if (args.verbose) {
+        std.debug.print("backend:         {s}\n", .{@tagName(backend)});
+        std.debug.print("main model:      {s}\n", .{paths.model});
+        if (partial_path) |p| std.debug.print("partial model:   {s}\n", .{p});
+    }
+
+    var session = asr.Session.open(allocator, .{
+        .backend = backend,
+        .model_path = paths.model,
+        .mmproj_path = paths.mmproj,
+        .whisper_partial_model_path = partial_path,
+        .language = language_z,
+        .n_threads = args.threads orelse 4,
+    }) catch |err| {
+        errors.print("error", err);
+        return 3;
+    };
+    defer session.close();
 
     // --partial only makes sense on whisper (qwen3 is one-shot enc-dec) and
     // only renders correctly on a TTY (the redraw uses CR + ANSI erase).
@@ -626,14 +667,18 @@ fn listen(
         }
     }.cb;
 
+    // If we probed an utterance during auto setup, transcribe it now via the
+    // freshly-opened backend so the user actually sees the first thing they
+    // said, not just the second utterance onward.
+    if (first_segment_owned) |samples| {
+        onSegment(&ctx, samples) catch |err| errors.print("warn", err);
+    }
+
     var pcm_buf: std.ArrayList(f32) = .empty;
     defer pcm_buf.deinit(allocator);
     var partial_iters: u32 = 0;
 
     while (g_running.load(.acquire)) {
-        // 50 ms pacing: matches our AudioQueue buffer cadence so we drain ~1
-        // callback's worth at a time. Direct usleep since std.posix.nanosleep
-        // and std.Thread.sleep both moved/disappeared in Zig 0.16.
         _ = usleep(drain_ms * 1000);
 
         pcm_buf.clearRetainingCapacity();
@@ -668,6 +713,41 @@ fn listen(
     detector.flush(&ctx, onSegment) catch |err| errors.print("warn", err);
     if (args.verbose) std.debug.print("\nstopped after {d} utterance(s)\n", .{ctx.utterance_id});
     return 0;
+}
+
+/// Drive the audio capture + VAD detector without any ASR model loaded,
+/// returning the samples of the first detected utterance (as an owned slice).
+/// Returns null on Ctrl-C before a segment fires. Used by `listen --backend auto`
+/// to pick the real backend lazily based on the first utterance.
+fn probeFirstUtterance(
+    allocator: std.mem.Allocator,
+    _: std.Io,
+    detector: *vad.Detector,
+    capture: *audio.Capture,
+) !?[]f32 {
+    const ProbeCtx = struct { samples: ?[]f32 = null, allocator: std.mem.Allocator };
+    var ctx = ProbeCtx{ .allocator = allocator };
+    const onSeg = struct {
+        fn cb(c_ctx: *ProbeCtx, samples: []const f32) anyerror!void {
+            if (c_ctx.samples != null) return; // already captured first
+            c_ctx.samples = try c_ctx.allocator.dupe(f32, samples);
+        }
+    }.cb;
+
+    var pcm_buf: std.ArrayList(f32) = .empty;
+    defer pcm_buf.deinit(allocator);
+
+    while (g_running.load(.acquire)) {
+        _ = usleep(50 * 1000);
+        pcm_buf.clearRetainingCapacity();
+        _ = capture.drain(allocator, &pcm_buf) catch continue;
+        if (pcm_buf.items.len == 0) continue;
+        detector.feed(allocator, pcm_buf.items, &ctx, onSeg) catch |err| {
+            errors.print("warn", err);
+        };
+        if (ctx.samples != null) break;
+    }
+    return ctx.samples;
 }
 
 fn appendLine(io: std.Io, path: []const u8, line: []const u8) !void {
