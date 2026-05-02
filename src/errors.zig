@@ -61,6 +61,16 @@ pub fn friendly(err: anyerror) Diagnostic {
             .hint = "is the server actually serving Qwen3-ASR?",
         },
 
+        // audio.zig
+        error.DeviceNotFound => .{
+            .summary = "input device not found",
+            .hint = "run `asrctl devices` to list available inputs; --device matches case-insensitive substring",
+        },
+        error.DeviceLookupFailed => .{
+            .summary = "could not query CoreAudio device list",
+            .hint = "this is a system-level failure; restart the audio daemon (`sudo killall coreaudiod`) and try again",
+        },
+
         // vad.zig
         error.SileroLoadFailed => .{
             .summary = "could not load silero VAD model",

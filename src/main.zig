@@ -144,6 +144,7 @@ fn run(init: std.process.Init) !u8 {
         },
         .model_path => return modelPath(allocator, io, &env),
         .model_pull => return modelPull(allocator, io, &env),
+        .devices => return listDevices(allocator, io),
         .transcribe => |args| return transcribe(allocator, io, &env, args),
         .listen => |args| return listen(allocator, io, &env, args),
         .bench_vad => |args| return benchVad(allocator, io, &env, args),
@@ -163,6 +164,27 @@ fn modelPath(
     const w = try hf.predictPath(allocator, io, env, .{ .repo = whisper_repo, .filename = whisper_default_main.filename() });
     defer allocator.free(w);
     try printStdout(io, "qwen3 model:   {s}\nqwen3 mmproj:  {s}\nwhisper model: {s}\n", .{ q_m, q_p, w });
+    return 0;
+}
+
+fn listDevices(allocator: std.mem.Allocator, io: std.Io) !u8 {
+    const devices = audio.listInputDevices(allocator) catch |err| {
+        errors.print("error", err);
+        return 2;
+    };
+    defer audio.freeDevices(allocator, devices);
+
+    // Sustained streaming writer (one positional writer per print would
+    // clobber prior lines on a redirected stdout — same trap as benchVad).
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
+    defer w.interface.flush() catch {};
+
+    if (devices.len == 0) {
+        try w.interface.writeAll("no input devices found\n");
+        return 0;
+    }
+    for (devices) |d| try w.interface.print("{s}\n", .{d.name});
     return 0;
 }
 
@@ -500,7 +522,7 @@ fn listen(
     };
     defer detector.deinit(allocator);
 
-    const capture = audio.Capture.start(allocator, 16_000) catch |err| {
+    const capture = audio.Capture.start(allocator, 16_000, args.device) catch |err| {
         errors.print("error", err);
         return 3;
     };

@@ -12,6 +12,7 @@ pub const Subcommand = union(enum) {
     listen: ListenArgs,
     model_path,
     model_pull,
+    devices,
     bench_vad: BenchVadArgs,
     version,
     help,
@@ -34,6 +35,11 @@ pub const ListenArgs = struct {
     /// medium-or-larger, otherwise same as main.
     whisper_partial_model: ?[]const u8 = null,
     language: ?[]const u8 = null,
+    /// Case-insensitive substring match against system input device names.
+    /// Passing e.g. "blackhole" routes capture through a loopback device for
+    /// transcribing system audio (browser tabs, video calls). null = system
+    /// default input.
+    device: ?[]const u8 = null,
     vad: ?[]const u8 = null, // "energy" | "silero"
     threads: ?i32 = null,
     threshold: ?f32 = null,
@@ -82,6 +88,7 @@ pub const usage_text =
     \\Usage:
     \\  asrctl <wav-file> [options]            transcribe a wav file
     \\  asrctl listen [options]                live mic → text (Ctrl-C to stop)
+    \\  asrctl devices                         list audio input devices
     \\  asrctl model path                      print resolved model paths
     \\  asrctl model pull                      download default backend model
     \\  asrctl version                         print version
@@ -108,6 +115,9 @@ pub const usage_text =
     \\      --whisper-partial-model NAME   smaller model for partials (default tiny
     \\                       when main is medium+, else same as main)
     \\      --language CODE  hint language for whisper
+    \\      --device NAME    input device (substring match; default = system input)
+    \\                       use `asrctl devices` to list. Pass e.g. "blackhole"
+    \\                       to transcribe system audio via a loopback driver.
     \\      --vad BACKEND    VAD backend: energy (default) | silero
     \\      --threshold F    VAD threshold (energy: RMS 0..1, silero: P 0..1)
     \\      --silence-ms N   silence duration that ends an utterance (default 600)
@@ -142,6 +152,7 @@ pub fn parse(argv: []const [*:0]const u8) ParseError!Subcommand {
         if (std.mem.eql(u8, sub, "pull")) return .model_pull;
         return error.InvalidArgs;
     }
+    if (std.mem.eql(u8, a1, "devices")) return .devices;
     if (std.mem.eql(u8, a1, "transcribe")) {
         return parseTranscribe(argv[2..]);
     }
@@ -189,6 +200,10 @@ fn parseListen(rest: []const [*:0]const u8) ParseError!Subcommand {
             i += 1;
             if (i >= rest.len) return error.MissingValue;
             args.whisper_partial_model = std.mem.span(rest[i]);
+        } else if (std.mem.eql(u8, a, "--device")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.device = std.mem.span(rest[i]);
         } else if (std.mem.eql(u8, a, "--vad")) {
             i += 1;
             if (i >= rest.len) return error.MissingValue;

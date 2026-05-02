@@ -27,6 +27,8 @@ pub const Error = error{
     EnqueueFailed,
     StartFailed,
     PipeFailed,
+    DeviceNotFound,
+    DeviceLookupFailed,
 } || std.mem.Allocator.Error;
 
 // ---------- AudioQueue C ABI bindings ----------
@@ -121,9 +123,180 @@ extern "c" fn AudioQueueEnqueueBuffer(
 extern "c" fn AudioQueueStart(inAQ: AudioQueueRef, inStartTime: ?*const AudioTimeStamp) OSStatus;
 extern "c" fn AudioQueueStop(inAQ: AudioQueueRef, inImmediate: u8) OSStatus;
 extern "c" fn AudioQueueDispose(inAQ: AudioQueueRef, inImmediate: u8) OSStatus;
+extern "c" fn AudioQueueSetProperty(
+    inAQ: AudioQueueRef,
+    inID: u32,
+    inData: *const anyopaque,
+    inDataSize: u32,
+) OSStatus;
 
 const kLinearPCMFormatFlagIsFloat: u32 = 1 << 0;
 const kLinearPCMFormatFlagIsPacked: u32 = 1 << 3;
+
+// ---------- CoreAudio HAL + CoreFoundation bindings (device enumeration) ----------
+
+const AudioObjectID = u32;
+
+const AudioObjectPropertyAddress = extern struct {
+    mSelector: u32,
+    mScope: u32,
+    mElement: u32,
+};
+
+const kAudioObjectSystemObject: AudioObjectID = 1;
+
+extern "c" fn AudioObjectGetPropertyDataSize(
+    inObjectID: AudioObjectID,
+    inAddress: *const AudioObjectPropertyAddress,
+    inQualifierDataSize: u32,
+    inQualifierData: ?*const anyopaque,
+    outDataSize: *u32,
+) OSStatus;
+
+extern "c" fn AudioObjectGetPropertyData(
+    inObjectID: AudioObjectID,
+    inAddress: *const AudioObjectPropertyAddress,
+    inQualifierDataSize: u32,
+    inQualifierData: ?*const anyopaque,
+    ioDataSize: *u32,
+    outData: *anyopaque,
+) OSStatus;
+
+const CFStringRef = ?*opaque {};
+const kCFStringEncodingUTF8: u32 = 0x08000100;
+
+extern "c" fn CFStringGetLength(s: CFStringRef) c_long;
+extern "c" fn CFStringGetMaximumSizeForEncoding(len: c_long, enc: u32) c_long;
+extern "c" fn CFStringGetCString(
+    s: CFStringRef,
+    buffer: [*]u8,
+    bufferSize: c_long,
+    encoding: u32,
+) u8;
+extern "c" fn CFStringCreateWithCString(
+    alloc: ?*anyopaque,
+    cstr: [*:0]const u8,
+    encoding: u32,
+) CFStringRef;
+extern "c" fn CFRelease(o: ?*anyopaque) void;
+
+pub const Device = struct {
+    /// User-facing device name, e.g. "MacBook Air Microphone" or "BlackHole 2ch".
+    name: []u8,
+    /// Stable UID that AudioQueue accepts via kAudioQueueProperty_CurrentDevice.
+    uid: []u8,
+
+    pub fn deinit(self: Device, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.uid);
+    }
+};
+
+/// Enumerate all input-capable devices on the system. Caller owns the slice
+/// and each Device's name/uid; use `freeDevices` to release them all.
+pub fn listInputDevices(allocator: std.mem.Allocator) ![]Device {
+    const all_devices_addr = AudioObjectPropertyAddress{
+        .mSelector = magic("dev#"), // kAudioHardwarePropertyDevices
+        .mScope = magic("glob"), // kAudioObjectPropertyScopeGlobal
+        .mElement = 0,
+    };
+    var size: u32 = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &all_devices_addr, 0, null, &size) != 0)
+        return error.DeviceLookupFailed;
+    const n = size / @sizeOf(AudioObjectID);
+    if (n == 0) return allocator.alloc(Device, 0);
+
+    const ids = try allocator.alloc(AudioObjectID, n);
+    defer allocator.free(ids);
+    if (AudioObjectGetPropertyData(
+        kAudioObjectSystemObject,
+        &all_devices_addr,
+        0,
+        null,
+        &size,
+        @ptrCast(ids.ptr),
+    ) != 0)
+        return error.DeviceLookupFailed;
+
+    var list: std.ArrayList(Device) = .empty;
+    errdefer {
+        for (list.items) |d| d.deinit(allocator);
+        list.deinit(allocator);
+    }
+
+    for (ids) |id| {
+        if (!hasInputStream(id)) continue;
+        const name = (cfStringProperty(allocator, id, magic("lnam")) catch continue) orelse continue;
+        errdefer allocator.free(name);
+        const uid = (cfStringProperty(allocator, id, magic("uid ")) catch null) orelse {
+            allocator.free(name);
+            continue;
+        };
+        try list.append(allocator, .{ .name = name, .uid = uid });
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+pub fn freeDevices(allocator: std.mem.Allocator, devices: []Device) void {
+    for (devices) |d| d.deinit(allocator);
+    allocator.free(devices);
+}
+
+fn hasInputStream(id: AudioObjectID) bool {
+    const addr = AudioObjectPropertyAddress{
+        .mSelector = magic("stm#"), // kAudioDevicePropertyStreams
+        .mScope = magic("inpt"), // kAudioObjectPropertyScopeInput
+        .mElement = 0,
+    };
+    var size: u32 = 0;
+    if (AudioObjectGetPropertyDataSize(id, &addr, 0, null, &size) != 0) return false;
+    return size > 0;
+}
+
+/// Reads a CFStringRef-valued property and returns it as a UTF-8 owned slice.
+fn cfStringProperty(
+    allocator: std.mem.Allocator,
+    id: AudioObjectID,
+    selector: u32,
+) !?[]u8 {
+    const addr = AudioObjectPropertyAddress{
+        .mSelector = selector,
+        .mScope = magic("glob"),
+        .mElement = 0,
+    };
+    var size: u32 = @sizeOf(CFStringRef);
+    var ref: CFStringRef = null;
+    if (AudioObjectGetPropertyData(id, &addr, 0, null, &size, @ptrCast(&ref)) != 0) return null;
+    const r = ref orelse return null;
+    defer CFRelease(@ptrCast(r));
+
+    const len = CFStringGetLength(r);
+    const max = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
+    const buf = try allocator.alloc(u8, @intCast(max));
+    errdefer allocator.free(buf);
+    if (CFStringGetCString(r, buf.ptr, max, kCFStringEncodingUTF8) == 0) {
+        allocator.free(buf);
+        return null;
+    }
+    const actual = std.mem.indexOfScalar(u8, buf, 0) orelse buf.len;
+    return try allocator.realloc(buf, actual);
+}
+
+/// Case-insensitive ASCII substring match. Used so users can pass partial
+/// names like "blackhole" or "macbook" without remembering exact device names.
+fn matchesDevice(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) break;
+        }
+        if (j == needle.len) return true;
+    }
+    return false;
+}
 
 // ---------- Public API ----------
 
@@ -165,7 +338,14 @@ pub const Capture = struct {
     /// longer than that, which is a different kind of bug.
     const ring_seconds = 30;
 
-    pub fn start(allocator: std.mem.Allocator, sample_rate: u32) Error!*Capture {
+    /// `device_name` is a case-insensitive substring match against the system
+    /// device names; null means use the system default input. Pass e.g.
+    /// "blackhole" to capture from a virtual loopback device.
+    pub fn start(
+        allocator: std.mem.Allocator,
+        sample_rate: u32,
+        device_name: ?[]const u8,
+    ) Error!*Capture {
         var self = try allocator.create(Capture);
         errdefer allocator.destroy(self);
 
@@ -215,6 +395,12 @@ pub const Capture = struct {
         if (AudioQueueNewInput(&fmt, callback, self, null, null, 0, &self.queue) != 0)
             return error.NewQueueFailed;
         errdefer _ = AudioQueueDispose(self.queue, 1);
+
+        // Optional device override. AudioQueue accepts the device's UID as a
+        // CFStringRef via kAudioQueueProperty_CurrentDevice. Sample-rate /
+        // channel conversion (BlackHole's stereo 48 kHz → our mono 16 kHz)
+        // is handled by AudioQueue's built-in converter.
+        if (device_name) |name| try setQueueDevice(allocator, self.queue, name);
 
         for (&self.buffers) |*b| {
             if (AudioQueueAllocateBuffer(self.queue, buffer_frames * 4, b) != 0)
@@ -281,6 +467,42 @@ pub const Capture = struct {
         return self.overflow.load(.monotonic);
     }
 };
+
+/// Find an input device whose name contains `needle` (case-insensitive) and
+/// bind the queue to it. On miss, prints the available devices to stderr so
+/// the user can copy-paste the right substring.
+fn setQueueDevice(
+    allocator: std.mem.Allocator,
+    queue: AudioQueueRef,
+    needle: []const u8,
+) Error!void {
+    const devices = try listInputDevices(allocator);
+    defer freeDevices(allocator, devices);
+
+    const match: ?Device = blk: {
+        for (devices) |d| if (matchesDevice(d.name, needle)) break :blk d;
+        break :blk null;
+    };
+    const m = match orelse {
+        std.debug.print("error: no input device matching '{s}'\n", .{needle});
+        std.debug.print("available input devices:\n", .{});
+        for (devices) |d| std.debug.print("  - {s}\n", .{d.name});
+        return error.DeviceNotFound;
+    };
+
+    const uid_z = try allocator.dupeZ(u8, m.uid);
+    defer allocator.free(uid_z);
+    const uid_ref = CFStringCreateWithCString(null, uid_z.ptr, kCFStringEncodingUTF8) orelse
+        return error.DeviceLookupFailed;
+    defer CFRelease(@ptrCast(uid_ref));
+
+    if (AudioQueueSetProperty(
+        queue,
+        magic("aqcd"), // kAudioQueueProperty_CurrentDevice
+        @ptrCast(&uid_ref),
+        @sizeOf(CFStringRef),
+    ) != 0) return error.NewQueueFailed;
+}
 
 fn setNonBlocking(fd: c_int) !void {
     const cur = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
