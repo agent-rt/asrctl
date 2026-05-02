@@ -235,9 +235,27 @@ fn transcribe(
     };
     defer session.close();
 
-    const result = session.transcribeFile(audio_z) catch |err| {
-        errors.print("error", err);
-        return 3;
+    // For --quick, decode wav ourselves and route through the audio_ctx-scaled
+    // PCM path. Otherwise use the file helper which goes through full ctx.
+    const result = blk: {
+        if (args.quick) {
+            if (backend != .whisper) {
+                std.debug.print("note: --quick is whisper-specific; ignored for qwen3\n", .{});
+            }
+            const decoded = asr.Wav.decodeFile(allocator, io, args.audio_path) catch |err| {
+                errors.print("error", err);
+                return 3;
+            };
+            defer decoded.deinit(allocator);
+            break :blk session.transcribePCMQuick(decoded.samples) catch |err| {
+                errors.print("error", err);
+                return 3;
+            };
+        }
+        break :blk session.transcribeFile(audio_z) catch |err| {
+            errors.print("error", err);
+            return 3;
+        };
     };
     defer result.deinit(allocator);
 
@@ -452,7 +470,7 @@ fn listen(
                 detector.segment.items.len >= min_partial_samples)
             {
                 partial_iters = 0;
-                if (session.transcribePCM(detector.segment.items)) |result| {
+                if (session.transcribePCMQuick(detector.segment.items)) |result| {
                     defer result.deinit(allocator);
                     // \r move-to-col-0, \x1b[K erase-to-end-of-line, dim ANSI.
                     printStdout(io, "\r\x1b[K\x1b[2m{s}\x1b[0m", .{result.text}) catch {};

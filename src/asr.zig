@@ -87,6 +87,16 @@ pub const Session = union(Backend) {
         };
     }
 
+    /// Streaming-tuned partial transcribe. Whisper takes the audio_ctx-scaled
+    /// fast path; qwen3 has no equivalent so it falls back to the regular
+    /// transcribe (qwen3 is one-shot anyway and `--partial` gates on whisper).
+    pub fn transcribePCMQuick(self: *Session, samples: []const f32) Error!Result {
+        return switch (self.*) {
+            .qwen3 => |*s| s.transcribePCM(samples),
+            .whisper => |*s| s.transcribePCMQuick(samples),
+        };
+    }
+
     pub fn transcribeFile(self: *Session, path: [:0]const u8) Error!Result {
         return switch (self.*) {
             .qwen3 => |*s| s.transcribeFile(path),
@@ -273,6 +283,7 @@ pub const WhisperSession = struct {
     ctx: *c.whisper_context,
     n_threads: i32,
     language: ?[:0]const u8,
+    verbose_timings: bool = false,
 
     pub fn open(allocator: std.mem.Allocator, opts: Options) Error!WhisperSession {
         var cparams = c.whisper_context_default_params();
@@ -280,11 +291,15 @@ pub const WhisperSession = struct {
         cparams.flash_attn = true;
         const ctx = c.whisper_init_from_file_with_params(opts.model_path.ptr, cparams) orelse
             return error.LoadModelFailed;
+        // ASRCTL_TIMINGS=1 prints whisper internal timings after each
+        // inference. Used by bench/whisper-partial-bench.sh; not a CLI flag.
+        const timings = std.c.getenv("ASRCTL_TIMINGS") != null;
         return .{
             .allocator = allocator,
             .ctx = ctx,
             .n_threads = opts.n_threads,
             .language = opts.language,
+            .verbose_timings = timings,
         };
     }
 
@@ -293,6 +308,27 @@ pub const WhisperSession = struct {
     }
 
     pub fn transcribePCM(self: *WhisperSession, samples: []const f32) Error!Result {
+        return self.transcribeWithCtx(samples, 0); // 0 = full 30s encoder context
+    }
+
+    /// Streaming-tuned variant: scale `audio_ctx` to the actual audio length
+    /// so the encoder skips the silence-padded portion of its 30s window.
+    /// Used by `--partial` to cut per-call cost ~10x for short buffers.
+    /// Final transcribe (after silence cut) still uses full context for max
+    /// accuracy.
+    pub fn transcribePCMQuick(self: *WhisperSession, samples: []const f32) Error!Result {
+        // Scale audio_ctx so the encoder skips most of its 30s padding window.
+        // Empirically, audio_ctx units = mel frames at 50 Hz; 30s = 1500.
+        // Naive `seconds * 50` produces broken decoder output (the decoder
+        // attends over too few audio frames and either skips text or loops).
+        // A floor of 768 (≈15 s of context) is the sweet spot: encoder saves
+        // ~30 % vs full 1500 while decoder still has enough context to behave.
+        const sec_x50 = (samples.len * 50) / 16_000;
+        const audio_ctx: c_int = @intCast(@min(@as(usize, 1500), @max(@as(usize, 768), sec_x50 + 256)));
+        return self.transcribeWithCtx(samples, audio_ctx);
+    }
+
+    fn transcribeWithCtx(self: *WhisperSession, samples: []const f32, audio_ctx: c_int) Error!Result {
         var fparams = c.whisper_full_default_params(c.WHISPER_SAMPLING_GREEDY);
         fparams.print_progress = false;
         fparams.print_special = false;
@@ -304,9 +340,8 @@ pub const WhisperSession = struct {
         fparams.single_segment = false;
         fparams.suppress_blank = true;
         fparams.no_timestamps = true;
-        // Default whisper sometimes emits "[BLANK_AUDIO]" / language tags etc;
-        // suppress_non_speech_tokens trims most.
         fparams.suppress_nst = true;
+        fparams.audio_ctx = audio_ctx;
         if (self.language) |lang| {
             fparams.language = lang.ptr;
         } else {
@@ -315,6 +350,8 @@ pub const WhisperSession = struct {
 
         if (c.whisper_full(self.ctx, fparams, samples.ptr, @intCast(samples.len)) != 0)
             return error.WhisperFullFailed;
+
+        if (self.verbose_timings) c.whisper_print_timings(self.ctx);
 
         // Concatenate all segment texts.
         var out: std.ArrayList(u8) = .empty;

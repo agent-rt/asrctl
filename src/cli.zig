@@ -40,6 +40,10 @@ pub const TranscribeArgs = struct {
     backend: ?[]const u8 = null, // "qwen3" | "whisper"
     language: ?[]const u8 = null,
     threads: ?i32 = null,
+    /// Whisper only: scale audio_ctx to actual audio length so the encoder
+    /// skips the silence-padded portion of its 30s window. Faster for short
+    /// clips, marginal accuracy loss on edge cases.
+    quick: bool = false,
     verbose: bool = false,
 };
 
@@ -73,6 +77,8 @@ pub const usage_text =
     \\      --language CODE  hint language for whisper (en/zh/auto/...). Qwen3 auto-detects.
     \\      --server-url URL forward to llama-server (qwen3 only) instead of
     \\                       loading the model in-process
+    \\      --quick          whisper: scale audio_ctx to actual length (fast,
+    \\                       slight accuracy trade-off on edge cases)
     \\      --threads N      CPU threads (default 4)
     \\  -v, --verbose        print timing/diagnostic info to stderr
     \\
@@ -204,6 +210,8 @@ fn parseTranscribe(rest: []const [*:0]const u8) ParseError!Subcommand {
             i += 1;
             if (i >= rest.len) return error.MissingValue;
             args.language = std.mem.span(rest[i]);
+        } else if (std.mem.eql(u8, a, "--quick")) {
+            args.quick = true;
         } else if (std.mem.eql(u8, a, "--threads")) {
             i += 1;
             if (i >= rest.len) return error.MissingValue;
