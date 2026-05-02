@@ -15,10 +15,54 @@ const qwen3_repo = "ggml-org/Qwen3-ASR-0.6B-GGUF";
 const qwen3_model_filename = "Qwen3-ASR-0.6B-Q8_0.gguf";
 const qwen3_mmproj_filename = "mmproj-Qwen3-ASR-0.6B-Q8_0.gguf";
 
-// Default whisper model (backend=whisper). large-v3-turbo Q5_0: 547 MB,
-// multilingual SOTA, ~30x realtime on Apple Silicon. Override via --model.
+// Whisper models. We map a friendly name → HF filename. Default (final) is
+// large-v3-turbo Q5_0: multilingual SOTA, ~30× realtime on M2 Pro.
+//
+// `--whisper-partial-model` defaults to `tiny` when --partial is used with a
+// `medium` or larger main model — gives ~50 ms partial latency vs ~500 ms for
+// running large twice. Smaller mains use the same model for both.
 const whisper_repo = "ggerganov/whisper.cpp";
-const whisper_model_filename = "ggml-large-v3-turbo-q5_0.bin";
+
+const WhisperModelSize = enum {
+    tiny,
+    base,
+    small,
+    medium,
+    large_v3_turbo,
+
+    fn parse(s: []const u8) ?WhisperModelSize {
+        if (std.mem.eql(u8, s, "tiny")) return .tiny;
+        if (std.mem.eql(u8, s, "base")) return .base;
+        if (std.mem.eql(u8, s, "small")) return .small;
+        if (std.mem.eql(u8, s, "medium")) return .medium;
+        if (std.mem.eql(u8, s, "large-v3-turbo") or std.mem.eql(u8, s, "large")) return .large_v3_turbo;
+        return null;
+    }
+
+    fn filename(self: WhisperModelSize) []const u8 {
+        return switch (self) {
+            .tiny => "ggml-tiny-q5_1.bin", // 31 MB
+            .base => "ggml-base-q5_1.bin", // 57 MB
+            .small => "ggml-small-q5_1.bin", // 181 MB
+            .medium => "ggml-medium-q5_0.bin", // 514 MB
+            .large_v3_turbo => "ggml-large-v3-turbo-q5_0.bin", // 547 MB
+        };
+    }
+
+    /// Used to decide whether `--partial` should auto-pair with tiny. We
+    /// only auto-switch when the main model is "noticeably bigger" than tiny,
+    /// otherwise the saving is marginal and the cost of a 2nd model load
+    /// outweighs the partial speedup.
+    fn isLargeForPartial(self: WhisperModelSize) bool {
+        return switch (self) {
+            .tiny, .base => false,
+            .small, .medium, .large_v3_turbo => true,
+        };
+    }
+};
+
+const whisper_default_main: WhisperModelSize = .large_v3_turbo;
+const whisper_default_partial: WhisperModelSize = .tiny;
 
 // Silero VAD model on HF — ggml-format binaries maintained alongside whisper.cpp.
 const vad_repo = "ggml-org/whisper-vad";
@@ -97,7 +141,7 @@ fn modelPath(
     defer allocator.free(q_m);
     const q_p = try hf.predictPath(allocator, io, env, .{ .repo = qwen3_repo, .filename = qwen3_mmproj_filename });
     defer allocator.free(q_p);
-    const w = try hf.predictPath(allocator, io, env, .{ .repo = whisper_repo, .filename = whisper_model_filename });
+    const w = try hf.predictPath(allocator, io, env, .{ .repo = whisper_repo, .filename = whisper_default_main.filename() });
     defer allocator.free(w);
     try printStdout(io, "qwen3 model:   {s}\nqwen3 mmproj:  {s}\nwhisper model: {s}\n", .{ q_m, q_p, w });
     return 0;
@@ -110,7 +154,7 @@ fn modelPull(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ
     defer allocator.free(q_m);
     const q_p = try hf.ensureFile(allocator, io, env, .{ .repo = qwen3_repo, .filename = qwen3_mmproj_filename });
     defer allocator.free(q_p);
-    const w = try hf.ensureFile(allocator, io, env, .{ .repo = whisper_repo, .filename = whisper_model_filename });
+    const w = try hf.ensureFile(allocator, io, env, .{ .repo = whisper_repo, .filename = whisper_default_main.filename() });
     defer allocator.free(w);
     try printStdout(io, "qwen3 model:   {s}\nqwen3 mmproj:  {s}\nwhisper model: {s}\n", .{ q_m, q_p, w });
     return 0;
@@ -135,6 +179,7 @@ fn resolvePaths(
     env: *std.process.Environ.Map,
     backend: asr.Backend,
     override_model: ?[]const u8,
+    whisper_size: WhisperModelSize,
 ) !ResolvedPaths {
     switch (backend) {
         .qwen3 => {
@@ -156,13 +201,24 @@ fn resolvePaths(
             const model = if (override_model) |p|
                 try allocator.dupeZ(u8, p)
             else blk: {
-                const p = try hf.ensureFile(allocator, io, env, .{ .repo = whisper_repo, .filename = whisper_model_filename });
+                const p = try hf.ensureFile(allocator, io, env, .{ .repo = whisper_repo, .filename = whisper_size.filename() });
                 defer allocator.free(p);
                 break :blk try allocator.dupeZ(u8, p);
             };
             return .{ .backend = .whisper, .model = model, .mmproj = null };
         },
     }
+}
+
+fn resolveWhisperSizePath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    size: WhisperModelSize,
+) ![:0]u8 {
+    const p = try hf.ensureFile(allocator, io, env, .{ .repo = whisper_repo, .filename = size.filename() });
+    defer allocator.free(p);
+    return try allocator.dupeZ(u8, p);
 }
 
 fn transcribe(
@@ -204,7 +260,16 @@ fn transcribe(
         c.mtmd_helper_log_set(quietLogCb, null);
     }
 
-    const paths = try resolvePaths(allocator, io, env, backend, args.model_path);
+    const whisper_size = blk: {
+        if (args.whisper_model) |s| {
+            if (WhisperModelSize.parse(s)) |sz| break :blk sz;
+            std.debug.print("error: unknown --whisper-model '{s}' (tiny|base|small|medium|large-v3-turbo)\n", .{s});
+            return 1;
+        }
+        break :blk whisper_default_main;
+    };
+
+    const paths = try resolvePaths(allocator, io, env, backend, args.model_path, whisper_size);
     defer paths.deinit(allocator);
 
     const language_z: ?[:0]const u8 = if (args.language) |l|
@@ -292,8 +357,46 @@ fn listen(
         c.mtmd_helper_log_set(quietLogCb, null);
     }
 
-    const paths = try resolvePaths(allocator, io, env, backend, args.model_path);
+    const whisper_size = blk: {
+        if (args.whisper_model) |s| {
+            if (WhisperModelSize.parse(s)) |sz| break :blk sz;
+            std.debug.print("error: unknown --whisper-model '{s}'\n", .{s});
+            return 1;
+        }
+        break :blk whisper_default_main;
+    };
+
+    // Smart default: when --partial is on with a medium+ main, transparently
+    // load `tiny` alongside it so partial preview is ~10× faster. User can
+    // override with --whisper-partial-model NAME or disable by passing
+    // --whisper-partial-model <same-as-main>.
+    const partial_size: ?WhisperModelSize = blk: {
+        if (backend != .whisper or !args.partial) break :blk null;
+        if (args.whisper_partial_model) |s| {
+            if (WhisperModelSize.parse(s)) |sz| {
+                if (sz == whisper_size) break :blk null; // no separate model needed
+                break :blk sz;
+            }
+            std.debug.print("error: unknown --whisper-partial-model '{s}'\n", .{s});
+            return 1;
+        }
+        if (whisper_size.isLargeForPartial()) break :blk whisper_default_partial;
+        break :blk null;
+    };
+
+    const paths = try resolvePaths(allocator, io, env, backend, args.model_path, whisper_size);
     defer paths.deinit(allocator);
+
+    const partial_path: ?[:0]u8 = if (partial_size) |sz|
+        try resolveWhisperSizePath(allocator, io, env, sz)
+    else
+        null;
+    defer if (partial_path) |p| allocator.free(p);
+
+    if (args.verbose) {
+        std.debug.print("whisper main:    {s}\n", .{paths.model});
+        if (partial_path) |p| std.debug.print("whisper partial: {s}\n", .{p});
+    }
 
     const language_z: ?[:0]const u8 = if (args.language) |l|
         try allocator.dupeZ(u8, l)
@@ -305,6 +408,7 @@ fn listen(
         .backend = backend,
         .model_path = paths.model,
         .mmproj_path = paths.mmproj,
+        .whisper_partial_model_path = partial_path,
         .language = language_z,
         .n_threads = args.threads orelse 4,
     }) catch |err| {

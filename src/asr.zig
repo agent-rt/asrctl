@@ -34,10 +34,13 @@ pub const Error = error{
 
 pub const Options = struct {
     backend: Backend = .qwen3,
-    /// Qwen3 main model.
+    /// Main model path. Qwen3: gguf; whisper: bin.
     model_path: [:0]const u8,
     /// Qwen3 mmproj. Ignored for `.whisper`.
     mmproj_path: ?[:0]const u8 = null,
+    /// Optional smaller whisper model for `transcribePCMQuick` (partials).
+    /// When null, partials reuse the main model. Ignored by qwen3.
+    whisper_partial_model_path: ?[:0]const u8 = null,
     n_threads: i32 = 4,
     n_ctx: u32 = 4096,
     max_tokens: usize = 256,
@@ -280,7 +283,13 @@ pub const parseOutput = parseQwen3Output;
 
 pub const WhisperSession = struct {
     allocator: std.mem.Allocator,
+    /// Main context: used by `transcribePCM` (final commits, single-shot files).
     ctx: *c.whisper_context,
+    /// Optional smaller context: used by `transcribePCMQuick` (live partials)
+    /// when the user asked for a separate `--whisper-partial-model`. Loading
+    /// a tiny model alongside large gives ~10× faster partials at the cost
+    /// of ~30 MB extra RAM/disk.
+    partial_ctx: ?*c.whisper_context = null,
     n_threads: i32,
     language: ?[:0]const u8,
     verbose_timings: bool = false,
@@ -291,12 +300,21 @@ pub const WhisperSession = struct {
         cparams.flash_attn = true;
         const ctx = c.whisper_init_from_file_with_params(opts.model_path.ptr, cparams) orelse
             return error.LoadModelFailed;
+        errdefer c.whisper_free(ctx);
+
+        const partial_ctx: ?*c.whisper_context = if (opts.whisper_partial_model_path) |p|
+            c.whisper_init_from_file_with_params(p.ptr, cparams) orelse
+                return error.LoadModelFailed
+        else
+            null;
+
         // ASRCTL_TIMINGS=1 prints whisper internal timings after each
         // inference. Used by bench/whisper-partial-bench.sh; not a CLI flag.
         const timings = std.c.getenv("ASRCTL_TIMINGS") != null;
         return .{
             .allocator = allocator,
             .ctx = ctx,
+            .partial_ctx = partial_ctx,
             .n_threads = opts.n_threads,
             .language = opts.language,
             .verbose_timings = timings,
@@ -304,6 +322,7 @@ pub const WhisperSession = struct {
     }
 
     pub fn close(self: *WhisperSession) void {
+        if (self.partial_ctx) |p| c.whisper_free(p);
         c.whisper_free(self.ctx);
     }
 
@@ -317,18 +336,21 @@ pub const WhisperSession = struct {
     /// Final transcribe (after silence cut) still uses full context for max
     /// accuracy.
     pub fn transcribePCMQuick(self: *WhisperSession, samples: []const f32) Error!Result {
-        // Scale audio_ctx so the encoder skips most of its 30s padding window.
-        // Empirically, audio_ctx units = mel frames at 50 Hz; 30s = 1500.
-        // Naive `seconds * 50` produces broken decoder output (the decoder
-        // attends over too few audio frames and either skips text or loops).
-        // A floor of 768 (≈15 s of context) is the sweet spot: encoder saves
-        // ~30 % vs full 1500 while decoder still has enough context to behave.
+        // Two ways to make a partial cheap:
+        //   1. audio_ctx scaling (skip pad portion of 30s encoder window)
+        //   2. a smaller model loaded as `partial_ctx` (e.g. tiny vs large)
+        // Use both when available — option (2) usually dominates by 5-10×.
         const sec_x50 = (samples.len * 50) / 16_000;
         const audio_ctx: c_int = @intCast(@min(@as(usize, 1500), @max(@as(usize, 768), sec_x50 + 256)));
-        return self.transcribeWithCtx(samples, audio_ctx);
+        const ctx = self.partial_ctx orelse self.ctx;
+        return self.transcribeWithCtxAndModel(ctx, samples, audio_ctx);
     }
 
     fn transcribeWithCtx(self: *WhisperSession, samples: []const f32, audio_ctx: c_int) Error!Result {
+        return self.transcribeWithCtxAndModel(self.ctx, samples, audio_ctx);
+    }
+
+    fn transcribeWithCtxAndModel(self: *WhisperSession, ctx: *c.whisper_context, samples: []const f32, audio_ctx: c_int) Error!Result {
         var fparams = c.whisper_full_default_params(c.WHISPER_SAMPLING_GREEDY);
         fparams.print_progress = false;
         fparams.print_special = false;
@@ -348,22 +370,21 @@ pub const WhisperSession = struct {
             fparams.language = "auto";
         }
 
-        if (c.whisper_full(self.ctx, fparams, samples.ptr, @intCast(samples.len)) != 0)
+        if (c.whisper_full(ctx, fparams, samples.ptr, @intCast(samples.len)) != 0)
             return error.WhisperFullFailed;
 
-        if (self.verbose_timings) c.whisper_print_timings(self.ctx);
+        if (self.verbose_timings) c.whisper_print_timings(ctx);
 
         // Concatenate all segment texts.
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(self.allocator);
 
-        const n = c.whisper_full_n_segments(self.ctx);
+        const n = c.whisper_full_n_segments(ctx);
         var i: c_int = 0;
         while (i < n) : (i += 1) {
-            const seg = c.whisper_full_get_segment_text(self.ctx, i);
+            const seg = c.whisper_full_get_segment_text(ctx, i);
             if (seg) |s| {
                 const slice = std.mem.span(s);
-                // Whisper segments often start with a leading space.
                 try out.appendSlice(self.allocator, slice);
             }
         }
@@ -371,8 +392,7 @@ pub const WhisperSession = struct {
         const text_owned = try self.allocator.dupe(u8, std.mem.trim(u8, out.items, " \n"));
         const raw_owned = try out.toOwnedSlice(self.allocator);
 
-        // Detected language id → string.
-        const lang_id = c.whisper_full_lang_id(self.ctx);
+        const lang_id = c.whisper_full_lang_id(ctx);
         const lang_str = c.whisper_lang_str(lang_id);
         const lang_owned = try self.allocator.dupe(u8, std.mem.span(lang_str));
 

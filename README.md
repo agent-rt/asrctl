@@ -30,6 +30,9 @@ EN: 5 s wav → ~1.2 s wall time. ZH: same. See [`bench/`](bench/).
 - ✅ v0.4: dual ASR backends — Qwen3-ASR + whisper-large-v3-turbo
   (`--backend qwen3|whisper`).
 - ✅ v0.5: whisper streaming partial words during speech (`listen --partial`).
+- ✅ v0.6: whisper `audio_ctx` scaling — partial inference -23% wall time.
+- ✅ v0.7: whisper model picker + dual-model partial preview
+  (`--whisper-model`, auto-loads tiny for partials → ~63 ms vs ~1 s).
 - See [`docs/REQ.md`](docs/REQ.md) for the full requirements & milestones.
 
 ## Backend comparison
@@ -142,12 +145,17 @@ asrctl listen -o transcript.log                   # append each utterance as a l
 **Live partial words** (whisper backend only) — see text appear *while* the
 user is still speaking, redrawn in dim text on the same line. When the
 utterance ends (silence cut), the line commits in normal weight + newline.
-Tune cadence via `--partial-ms 500` (default).
+
+By default a tiny whisper (~31 MB) is loaded alongside the large model so
+partials render at ~63 ms each instead of ~1 s. Tune via:
+- `--whisper-model {tiny,base,small,medium,large-v3-turbo}` — main / final
+- `--whisper-partial-model NAME` — override the auto-picked partial
+- `--partial-ms 500` — cadence
 
 ```
 listening (Ctrl-C to stop, partial=on)…
-hello world how are                  ← redrawn every 500ms during speech
-hello world, how are you?            ← committed on silence
+hello world how are                  ← tiny redraws every 500ms during speech
+hello world, how are you?            ← large commits on silence
 ```
 
 VAD backends:

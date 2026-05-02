@@ -13,7 +13,8 @@
 | **v0.4** | 双 ASR 后端（Qwen3 + whisper-large-v3-turbo） | ✅ 通过（2026-05-02），见 [v0.4-report.md](./v0.4-report.md) |
 | **v0.5** | whisper streaming partial words（边说边出文字） | ✅ 通过（2026-05-02），见 [v0.5-report.md](./v0.5-report.md) |
 | **v0.6** | whisper audio_ctx 缩放，partial 推理 -23% | ✅ 通过（2026-05-02），见 [v0.6-report.md](./v0.6-report.md) |
-| **v0.7+** | mp3/m4a 格式、多 whisper 模型档位、WER bench | 未承诺 |
+| **v0.7** | 5 档 whisper 模型 + 双模型 partial（tiny + main） | ✅ 通过（2026-05-02），见 [v0.7-report.md](./v0.7-report.md) |
+| **v0.8+** | 自动 backend 选择（语言探针）、mp3/m4a 格式、WER bench | 未承诺 |
 
 ## 1. 目标（MVP）
 

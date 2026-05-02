@@ -20,6 +20,11 @@ pub const ListenArgs = struct {
     output_path: ?[]const u8 = null,
     model_path: ?[]const u8 = null,
     backend: ?[]const u8 = null, // "qwen3" | "whisper"
+    whisper_model: ?[]const u8 = null,
+    /// Optional smaller whisper model loaded just for partial preview while
+    /// user is speaking. Defaults to `tiny` when --partial + main model is
+    /// medium-or-larger, otherwise same as main.
+    whisper_partial_model: ?[]const u8 = null,
     language: ?[]const u8 = null,
     vad: ?[]const u8 = null, // "energy" | "silero"
     threads: ?i32 = null,
@@ -38,6 +43,7 @@ pub const TranscribeArgs = struct {
     model_path: ?[]const u8 = null,
     server_url: ?[]const u8 = null,
     backend: ?[]const u8 = null, // "qwen3" | "whisper"
+    whisper_model: ?[]const u8 = null, // "tiny"|"base"|"small"|"medium"|"large-v3-turbo"
     language: ?[]const u8 = null,
     threads: ?i32 = null,
     /// Whisper only: scale audio_ctx to actual audio length so the encoder
@@ -74,6 +80,7 @@ pub const usage_text =
     \\  -o, --output PATH    write text to file instead of stdout
     \\      --backend NAME   ASR backend: qwen3 (default) | whisper
     \\      --model PATH     override model gguf/bin path
+    \\      --whisper-model NAME  whisper size: tiny|base|small|medium|large-v3-turbo
     \\      --language CODE  hint language for whisper (en/zh/auto/...). Qwen3 auto-detects.
     \\      --server-url URL forward to llama-server (qwen3 only) instead of
     \\                       loading the model in-process
@@ -86,6 +93,9 @@ pub const usage_text =
     \\  -o, --output PATH    append each utterance to file instead of stdout
     \\      --backend NAME   ASR backend: qwen3 (default) | whisper
     \\      --model PATH     override model path
+    \\      --whisper-model NAME           whisper main size (default large-v3-turbo)
+    \\      --whisper-partial-model NAME   smaller model for partials (default tiny
+    \\                       when main is medium+, else same as main)
     \\      --language CODE  hint language for whisper
     \\      --vad BACKEND    VAD backend: energy (default) | silero
     \\      --threshold F    VAD threshold (energy: RMS 0..1, silero: P 0..1)
@@ -156,6 +166,14 @@ fn parseListen(rest: []const [*:0]const u8) ParseError!Subcommand {
             i += 1;
             if (i >= rest.len) return error.MissingValue;
             args.language = std.mem.span(rest[i]);
+        } else if (std.mem.eql(u8, a, "--whisper-model")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.whisper_model = std.mem.span(rest[i]);
+        } else if (std.mem.eql(u8, a, "--whisper-partial-model")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.whisper_partial_model = std.mem.span(rest[i]);
         } else if (std.mem.eql(u8, a, "--vad")) {
             i += 1;
             if (i >= rest.len) return error.MissingValue;
@@ -210,6 +228,10 @@ fn parseTranscribe(rest: []const [*:0]const u8) ParseError!Subcommand {
             i += 1;
             if (i >= rest.len) return error.MissingValue;
             args.language = std.mem.span(rest[i]);
+        } else if (std.mem.eql(u8, a, "--whisper-model")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.whisper_model = std.mem.span(rest[i]);
         } else if (std.mem.eql(u8, a, "--quick")) {
             args.quick = true;
         } else if (std.mem.eql(u8, a, "--threads")) {
