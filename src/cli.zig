@@ -25,6 +25,10 @@ pub const ListenArgs = struct {
     threads: ?i32 = null,
     threshold: ?f32 = null,
     silence_ms: ?u32 = null,
+    /// Stream partial transcriptions while user is still speaking. Whisper
+    /// backend only; needs a TTY stdout to render the in-place redraw.
+    partial: bool = false,
+    partial_ms: ?u32 = null,
     verbose: bool = false,
 };
 
@@ -80,6 +84,8 @@ pub const usage_text =
     \\      --vad BACKEND    VAD backend: energy (default) | silero
     \\      --threshold F    VAD threshold (energy: RMS 0..1, silero: P 0..1)
     \\      --silence-ms N   silence duration that ends an utterance (default 600)
+    \\      --partial        stream partial transcriptions during speech (whisper only)
+    \\      --partial-ms N   partial cadence in ms (default 500)
     \\      --threads N      CPU threads (default 4)
     \\  -v, --verbose        print VAD/timing info to stderr
     \\
@@ -156,6 +162,12 @@ fn parseListen(rest: []const [*:0]const u8) ParseError!Subcommand {
             i += 1;
             if (i >= rest.len) return error.MissingValue;
             args.silence_ms = try std.fmt.parseInt(u32, std.mem.span(rest[i]), 10);
+        } else if (std.mem.eql(u8, a, "--partial")) {
+            args.partial = true;
+        } else if (std.mem.eql(u8, a, "--partial-ms")) {
+            i += 1;
+            if (i >= rest.len) return error.MissingValue;
+            args.partial_ms = try std.fmt.parseInt(u32, std.mem.span(rest[i]), 10);
         } else if (std.mem.eql(u8, a, "-v") or std.mem.eql(u8, a, "--verbose")) {
             args.verbose = true;
         } else {

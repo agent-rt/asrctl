@@ -251,6 +251,7 @@ fn transcribe(
 var g_running: std.atomic.Value(bool) = .init(true);
 
 extern "c" fn usleep(usec: u32) c_int;
+extern "c" fn isatty(fd: c_int) c_int;
 
 fn sigintHandler(_: std.posix.SIG) callconv(.c) void {
     g_running.store(false, .release);
@@ -355,7 +356,28 @@ fn listen(
         std.posix.sigaction(std.posix.SIG.INT, &dfl, null);
     }
 
-    if (args.verbose) std.debug.print("listening (Ctrl-C to stop)…\n", .{});
+    // --partial only makes sense on whisper (qwen3 is one-shot enc-dec) and
+    // only renders correctly on a TTY (the redraw uses CR + ANSI erase).
+    const stdout_tty = isatty(1) != 0;
+    const partial_enabled = args.partial and backend == .whisper and
+        stdout_tty and args.output_path == null;
+    if (args.partial and backend != .whisper) {
+        std.debug.print("error: --partial requires --backend whisper\n", .{});
+        return 1;
+    }
+    if (args.partial and !stdout_tty and args.verbose)
+        std.debug.print("note: stdout is not a TTY, partials disabled\n", .{});
+
+    const partial_ms = args.partial_ms orelse 500;
+    const drain_ms: u32 = 50;
+    const partial_target_iters: u32 = if (partial_ms < drain_ms) 1 else partial_ms / drain_ms;
+    // Don't bother running whisper on <1s of audio; quality is unstable.
+    const min_partial_samples: usize = 16_000;
+
+    if (args.verbose) std.debug.print(
+        "listening (Ctrl-C to stop, partial={s})…\n",
+        .{if (partial_enabled) "on" else "off"},
+    );
 
     const Ctx = struct {
         session: *asr.Session,
@@ -363,6 +385,7 @@ fn listen(
         io: std.Io,
         output_path: ?[]const u8,
         verbose: bool,
+        partial_drawn: bool, // true if a partial line is currently on stdout
         utterance_id: u32 = 0,
     };
     var ctx: Ctx = .{
@@ -371,6 +394,7 @@ fn listen(
         .io = io,
         .output_path = args.output_path,
         .verbose = args.verbose,
+        .partial_drawn = false,
     };
 
     const onSegment = struct {
@@ -390,6 +414,11 @@ fn listen(
             if (c_ctx.output_path) |path| {
                 try appendLine(c_ctx.io, path, result.text);
             } else {
+                if (c_ctx.partial_drawn) {
+                    // Erase the in-flight dim partial, then commit final.
+                    try writeStdout(c_ctx.io, "\r\x1b[K");
+                    c_ctx.partial_drawn = false;
+                }
                 try writeStdout(c_ctx.io, result.text);
                 try writeStdout(c_ctx.io, "\n");
             }
@@ -398,12 +427,13 @@ fn listen(
 
     var pcm_buf: std.ArrayList(f32) = .empty;
     defer pcm_buf.deinit(allocator);
+    var partial_iters: u32 = 0;
 
     while (g_running.load(.acquire)) {
         // 50 ms pacing: matches our AudioQueue buffer cadence so we drain ~1
         // callback's worth at a time. Direct usleep since std.posix.nanosleep
         // and std.Thread.sleep both moved/disappeared in Zig 0.16.
-        _ = usleep(50_000);
+        _ = usleep(drain_ms * 1000);
 
         pcm_buf.clearRetainingCapacity();
         _ = capture.drain(allocator, &pcm_buf) catch continue;
@@ -412,6 +442,26 @@ fn listen(
         detector.feed(allocator, pcm_buf.items, &ctx, onSegment) catch |err| {
             errors.print("warn", err);
         };
+
+        // Streaming partial preview: while we're collecting an utterance,
+        // periodically run whisper on the in-flight buffer and redraw the
+        // line in dim text. No-op for energy/qwen3 / file output / non-TTY.
+        if (partial_enabled and detector.state == .active) {
+            partial_iters += 1;
+            if (partial_iters >= partial_target_iters and
+                detector.segment.items.len >= min_partial_samples)
+            {
+                partial_iters = 0;
+                if (session.transcribePCM(detector.segment.items)) |result| {
+                    defer result.deinit(allocator);
+                    // \r move-to-col-0, \x1b[K erase-to-end-of-line, dim ANSI.
+                    printStdout(io, "\r\x1b[K\x1b[2m{s}\x1b[0m", .{result.text}) catch {};
+                    ctx.partial_drawn = true;
+                } else |_| {}
+            }
+        } else {
+            partial_iters = 0;
+        }
     }
 
     detector.flush(&ctx, onSegment) catch |err| errors.print("warn", err);

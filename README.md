@@ -29,6 +29,7 @@ EN: 5 s wav → ~1.2 s wall time. ZH: same. See [`bench/`](bench/).
 - ✅ v0.3: silero neural VAD via vendored whisper.cpp (`--vad silero`).
 - ✅ v0.4: dual ASR backends — Qwen3-ASR + whisper-large-v3-turbo
   (`--backend qwen3|whisper`).
+- ✅ v0.5: whisper streaming partial words during speech (`listen --partial`).
 - See [`docs/REQ.md`](docs/REQ.md) for the full requirements & milestones.
 
 ## Backend comparison
@@ -131,11 +132,22 @@ Exit codes: `0` ok / `1` user error / `2` internal / `3` inference / `4` server.
 ### Live microphone (`listen`)
 
 ```sh
-asrctl listen                     # speak; Ctrl-C to stop
-asrctl listen --vad silero        # neural VAD, better noise robustness
-asrctl listen -v                  # see VAD + per-utterance timing on stderr
-asrctl listen -o transcript.log   # append each utterance as a new line
-asrctl listen --threshold 0.5 --silence-ms 500   # tune VAD for your env
+asrctl listen                                     # qwen3 + energy VAD
+asrctl listen --vad silero                        # neural VAD
+asrctl listen --backend whisper --partial         # whisper + LIVE PARTIAL words
+asrctl listen --backend whisper --partial --vad silero   # full SOTA stack
+asrctl listen -o transcript.log                   # append each utterance as a line
+```
+
+**Live partial words** (whisper backend only) — see text appear *while* the
+user is still speaking, redrawn in dim text on the same line. When the
+utterance ends (silence cut), the line commits in normal weight + newline.
+Tune cadence via `--partial-ms 500` (default).
+
+```
+listening (Ctrl-C to stop, partial=on)…
+hello world how are                  ← redrawn every 500ms during speech
+hello world, how are you?            ← committed on silence
 ```
 
 VAD backends:
